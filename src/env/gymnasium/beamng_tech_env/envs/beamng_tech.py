@@ -4,14 +4,24 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 from beamngpy import BeamNGpy, Scenario, Vehicle
-from beamngpy.sensors import AdvancedIMU, Damage, Electrics, Lidar, Timer
+from beamngpy.sensors import Damage, Electrics, Lidar
+
+_T0 = time.perf_counter()
+def _dbg(msg):
+    print(f"[{time.perf_counter() - _T0:8.2f}s] {msg}", flush=True)
 
 # general limits
 DAMAGE_LIMIT        = 1000
 EPISODE_TIMEOUT     = 64.0
-FPS                 = 20
+FPS                 = 20   # physics tick rate (fixed by the engine, step(1) = 50 ms of sim time)
+RENDER_FPS          = 120  # render loop rate: how often the game's main loop wakes up to process socket requests
 FPS_FACTOR          = 1
 MIN_SPEED           = 10.0
+
+# drift band, mirrored from the game's driftOptions (drift.lua:86-98)
+DRIFT_MIN_ANGLE    = 7.0    # deg, below this is not a drift
+DRIFT_MAX_ANGLE    = 165.0  # deg, above this is a spin
+DRIFT_MIN_AIRSPEED = 4.0    # kph, minimum speed to count as drifting
 
 # sensor value limits
 IMU_ACC_MAX      = 20.0   # m/s^2  (~2 g per axis, covers hard drift loads)
@@ -37,6 +47,75 @@ DRIFT_CARS_6SPEED = [
     {"model": "fullsize", "part_config": "drift"},
     {"model": "sbr", "part_config": "drift"},
 ]
+
+def drift_from_state(state):
+    """Per-vehicle drift telemetry from the State sensor, no game round trip.
+
+    Mirrors the game's formulas (drift.lua:230-231): the drift angle is the
+    absolute yaw difference between the velocity direction and the heading,
+    signed by vel . (up x dir). The game's drift score is player-centric, so
+    for a group of vehicles we compute a per-frame score proxy here instead.
+    """
+    vel = np.asarray(state["vel"], float)
+    dirv = np.asarray(state["dir"], float)
+    up = np.asarray(state["up"], float)
+    speed_kph = float(np.linalg.norm(vel) * 3.6)
+    if speed_kph < 1.0:
+        return {"angle": 0.0, "airSpeed": speed_kph,
+                "isDrifting": False, "scoreAdded": 0.0}
+
+    d = dirv / np.linalg.norm(dirv)
+    v = vel / np.linalg.norm(vel)
+    # the game measures slip as a horizontal-plane (x, y) yaw difference via
+    # atan2, not the full 3D angle (drift.lua:201-230); mirror that exactly so
+    # the parity holds on slopes, where the 3D arccos would pick up pitch
+    yaw_diff = np.arctan2(d[1], d[0]) - np.arctan2(v[1], v[0])
+    yaw_diff = (yaw_diff + np.pi) % (2.0 * np.pi) - np.pi
+    angle = float(abs(np.degrees(yaw_diff)))
+    sign = float(np.sign(np.dot(vel, np.cross(up, dirv))))
+    is_drifting = (DRIFT_MIN_ANGLE < angle < DRIFT_MAX_ANGLE
+                   and speed_kph > DRIFT_MIN_AIRSPEED)
+    # per-frame score proxy, scaled so the reward stays in a similar range
+    score_added = ((angle / DRIFT_MAX_ANGLE)
+                   * (speed_kph / AIRSPEED_MAX_KPH) * 100.0
+                   if is_drifting else 0.0)
+    return {"angle": angle * sign, "airSpeed": speed_kph,
+            "isDrifting": is_drifting, "scoreAdded": score_added}
+
+def car_rotation(state):
+    """Rotation matrix whose COLUMNS are the car's [forward, left, up] axes in
+    world space, built from the (normalised) dir and up vectors."""
+    d = np.asarray(state["dir"], float); d /= np.linalg.norm(d)
+    u = np.asarray(state["up"], float);  u /= np.linalg.norm(u)
+    l = np.cross(u, d)                     # left
+    l /= np.linalg.norm(l)
+    return np.stack([d, l, u], axis=1)     # columns [fwd, left, up]
+
+def lidar_bev(pc, state, drift, n=BEV_N, range_m=LIDAR_MAX_DIST):
+    """Bird's eye view height grid: the car is in the center, the grid spans
+    [-range_m, +range_m] around it, values are the highest LiDAR return per
+    cell clamped to [0, 1] (0.5 = road level)."""
+    out = np.full((n, n), np.nan, np.float32)
+    if pc.size == 0:
+        return out
+    R = car_rotation(state)
+    p = (pc - np.asarray(state["pos"], float)) @ R   # [fwd, left, up]
+    x, y, z = p[:, 0], p[:, 1], p[:, 2]
+    slip = float(np.deg2rad(drift.get("angle", 0.0)))
+    th = 0.5 * np.pi - slip
+    c, s = np.cos(th), np.sin(th)
+    dx, dy = x * c - y * s, x * s + y * c
+    ix = ((dx + range_m) * n / (2 * range_m)).astype(int)
+    iy = ((dy + range_m) * n / (2 * range_m)).astype(int)
+    m = (ix >= 0) & (iy >= 0) & (ix < n) & (iy < n)
+    cell = (n - 1 - iy[m]) * n + ix[m]
+    h = np.clip((z[m] - Z_LO) / (Z_HI - Z_LO), 0.0, 1.0)
+    # max height per cell in one O(N) pass via an unbuffered ufunc;
+    # ~3-4x faster than argsort + unique + reduceat on a full point cloud
+    out_flat = np.full(n * n, -np.inf, np.float32)
+    np.maximum.at(out_flat, cell, h)
+    out_flat[out_flat == -np.inf] = np.nan
+    return out_flat.reshape(n, n)
 
 class BeamNGTechEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": FPS * FPS_FACTOR}
@@ -81,36 +160,40 @@ class BeamNGTechEnv(gym.Env):
             damage = 0.0
         )
 
+        # running total of the self-computed drift score for the episode
+        self._score_total = 0.0
+        # simulation time at the last reset, for the episode timeout
+        self._t0 = 0.0
+
+        # State snapshot from the previous step, for the derived IMU
+        self._prev_state = None
+        # derived IMU channels for the current step (see _derive_imu)
+        self._imu_acc = np.zeros(3, dtype=np.float32)
+        self._imu_angvel = np.zeros(3, dtype=np.float32)
+        # sim time of the last completed step, for the stale-read check
+        self._last_step_time = 0.0
+        # in-flight sensor request responses (see _send_sensor_request)
+        self._sensor_engine_resp = None
+        self._sensor_vehicle_resp = None
+
         self.window = None
 
     def _get_obs(self):
-        self.ego.sensors.poll()
+        # pure computation from the cached sensor data: no round trips here,
+        # step() (or reset()) polls before calling this
         e = self.ego.sensors["electrics"]
-        imu_data = self.imu.poll()
-        drift = self._read_drift()
+        drift = drift_from_state(self.ego.state)
 
-        # bulk mode returns a list of readings
-        if isinstance(imu_data, list):
-            imu_data = imu_data[-1]
+        acc, angvel = self._imu_acc, self._imu_angvel
+        if drift["airSpeed"] <= 1.0:
+            acc = np.zeros(3, dtype=np.float32)
+            angvel = np.zeros(3, dtype=np.float32)
 
-        acc    = np.clip(np.asarray(imu_data["accRaw"], np.float32) / IMU_ACC_MAX, -1.0, 1.0)    if drift["airSpeed"] > 1.0 else np.zeros(3, dtype=np.float32)
-        angvel = np.clip(np.asarray(imu_data["angVel"], np.float32) / IMU_ANGVEL_MAX, -1.0, 1.0) if drift["airSpeed"] > 1.0 else np.zeros(3, dtype=np.float32)
-
-        # BEV from the LiDAR (built in the previous chapter)
-        bev = np.nan_to_num(self._lidar_bev(self.lidar.poll()["pointCloud"],
+        bev = np.nan_to_num(lidar_bev(self._poll_lidar_points(),
                                       self.ego.state,
                                       drift,
                                       n=BEV_N),
                             nan=0.5)
-
-        # relevant information for a current frame, for reward calculation
-        self.current["speed"] = drift["airSpeed"]
-        self.current["score"] = drift["potentialScore"]
-        dmg = self.ego.sensors["damage"]
-        if isinstance(dmg, dict):
-            self.current["damage"] = dmg.get("damage", 0.0)
-        else:
-            self.current["damage"] = 0.0
 
         return {
             "rpm":         np.clip(np.array([e["rpm"] / e["maxrpm"]], np.float32), 0.0, 1.0),
@@ -122,6 +205,107 @@ class BeamNGTechEnv(gym.Env):
             "bev":         bev,
         }
 
+    def _send_sensor_request(self):
+        """Send the bundled sensor request without waiting (send half of poll)."""
+        engine_reqs, vehicle_reqs = self.ego.sensors._encode_requests(
+            tuple(self.ego.sensors._sensors.keys()))
+        self._sensor_engine_resp = (self.beamng._send(engine_reqs)
+                                    if engine_reqs["sensors"] else None)
+        self._sensor_vehicle_resp = (self.ego._send(vehicle_reqs)
+                                     if vehicle_reqs["sensors"] else None)
+
+    def _recv_sensor_data(self):
+        """Receive and decode a previously sent sensor request (recv half of poll)."""
+        sensor_data = dict()
+        if self._sensor_engine_resp is not None:
+            sensor_data.update(self._sensor_engine_resp.recv("SensorData")["data"])
+        if self._sensor_vehicle_resp is not None:
+            sensor_data.update(self._sensor_vehicle_resp.recv("SensorData")["data"])
+        result = self.ego.sensors._decode_response(sensor_data)
+        for sensor, data in result.items():
+            self.ego.sensors._sensors[sensor].replace(data)
+        self._sensor_engine_resp = None
+        self._sensor_vehicle_resp = None
+
+    def _poll_sensors(self):
+        """Blocking sensor poll; off the hot path (reset, stale-read fallback)."""
+        self._send_sensor_request()
+        self._recv_sensor_data()
+
+    def _poll_lidar_points(self):
+        """Point cloud from shared memory, skipping the colour buffer (unused).
+
+        Mirrors Lidar._convert_binary_to_array: in streaming mode the game
+        writes the point count as the last float of the buffer.
+        """
+        shmem = self.lidar.point_cloud_shmem
+        buf = np.frombuffer(shmem.read(self.lidar.point_cloud_shmem_size),
+                            dtype=np.float32)
+        n = int(buf[-1])
+        if n <= 0 or n * 3 > len(buf) - 1:
+            return np.empty((0, 3), dtype=np.float32)
+        return buf[: 3 * n].reshape(-1, 3).copy()
+
+    def _derive_imu(self, state):
+        """Accel and angular velocity from two consecutive State snapshots,
+        replacing the AdvancedIMU poll (one less round trip per step).
+
+        Channels are in the car frame with the [fwd, left, up] axis order:
+        acc = [longitudinal, lateral, vertical] (kinematic d(vel)/dt, so no
+        gravity offset in the vertical channel, unlike the raw IMU),
+        angvel = [roll, pitch, yaw] rates in rad/s.
+        """
+        prev = self._prev_state
+        # copy the fields: ego.state is mutated in place by the next poll, so
+        # a reference would make prev identical to state (dt = 0)
+        self._prev_state = {
+            "vel": np.array(state["vel"], float),
+            "dir": np.array(state["dir"], float),
+            "up": np.array(state["up"], float),
+            "time": float(state["time"]),
+        }
+        if prev is None:
+            return np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
+        dt = float(state["time"]) - float(prev["time"])
+        if dt < 0.04:
+            return np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
+
+        R = car_rotation(state)
+        v_car = R.T @ np.asarray(state["vel"], float)
+        v_car_prev = car_rotation(prev).T @ np.asarray(prev["vel"], float)
+        acc = (v_car - v_car_prev) / dt
+
+        dR = R.T @ car_rotation(prev)
+        skew = 0.5 * np.array([
+            dR[2, 1] - dR[1, 2],
+            dR[0, 2] - dR[2, 0],
+            dR[1, 0] - dR[0, 1],
+        ])
+        theta = float(np.arccos(np.clip((np.trace(dR) - 1.0) / 2.0, -1.0, 1.0)))
+        if theta > 1e-4:
+            angvel = skew * (theta / np.sin(theta)) / dt
+        else:
+            angvel = skew / dt
+
+        acc = np.clip(acc / IMU_ACC_MAX, -1.0, 1.0)
+        angvel = np.clip(angvel / IMU_ANGVEL_MAX, -1.0, 1.0)
+        return acc.astype(np.float32), angvel.astype(np.float32)
+
+    def _update_reward_state(self):
+        """Update the reward bookkeeping from fresh sensor data. Called in
+        step() before _compute_reward, so the reward reflects the tick that
+        just ran (previously _get_obs did this after the reward computation,
+        leaving the reward one step stale)."""
+        drift = drift_from_state(self.ego.state)
+        self.current["speed"] = drift["airSpeed"]
+        self._score_total += drift["scoreAdded"]
+        self.current["score"] = self._score_total
+        dmg = self.ego.sensors["damage"]
+        if isinstance(dmg, dict):
+            self.current["damage"] = dmg.get("damage", 0.0)
+        else:
+            self.current["damage"] = 0.0
+
     def _get_info(self):
         return {}
 
@@ -132,20 +316,13 @@ class BeamNGTechEnv(gym.Env):
         # Sensors
         self.electrics = Electrics()
         self.damage = Damage()
-        self.timer = Timer()
 
         self.ego.sensors.attach("electrics", self.electrics)
         self.ego.sensors.attach("damage", self.damage)
-        self.ego.sensors.attach("timer", self.timer)
 
-        self.imu = AdvancedIMU("imu",
-            self.beamng,
-            self.ego,
-            gfx_update_time=1.0/LIDAR_HZ,
-            is_send_immediately=True,
-            is_dir_world_space=False,
-            pos=(0, 0, 0.5)
-        )
+        # no AdvancedIMU: acc/angvel are derived from the State sensor in
+        # _derive_imu, which saves one blocking round trip per step
+
         self.lidar = Lidar(
             "roof",
             self.beamng,
@@ -164,77 +341,102 @@ class BeamNGTechEnv(gym.Env):
             is_streaming=True,
         )
 
-    def _action_to_control(self, action):
-        steering, combined, parkingbrake = (float(value) for value in action["controls"])
-        brake = 0.0
-        throttle = 0.0
-
-        if combined > 0.0:
-            throttle = combined
-        else:
-            brake = -combined
-
-        self.ego.control(
-            steering=steering,
-            throttle=throttle,
-            brake=brake,
-            parkingbrake=0.0 if parkingbrake < 0.0 else parkingbrake,
-        )
-        return {
-            "steering": steering,
-            "throttle": throttle,
-            "brake": brake,
-            "parkingbrake": parkingbrake,
-        }
-
     def reset(self, seed=None, options=None):
         # We need the following line to seed self.np_random
         super().reset(seed=seed)
+        _dbg("reset: start")
 
         # start BeamNG.drive on the first reset (works with reset-first ordering)
         if self.window is None:
             self._first_time_setup()
+        _dbg("reset: first_time_setup done")
 
         # unpause physics / time
         self.beamng.control.resume()
         time.sleep(1)
+        _dbg("reset: resumed")
         # vehicle switch
         self.scenario.remove_vehicle(self.ego)
         self.beamng.scenario.restart()
+        _dbg("reset: scenario restarted")
         car = DRIFT_CARS_6SPEED[self.np_random.integers(len(DRIFT_CARS_6SPEED))]
+        if options is not None and "car" in options:
+            car = options["car"]
         waypoint_keys = list(self.waypoints.keys())
         key = waypoint_keys[self.np_random.integers(len(waypoint_keys))]
         self.ego = Vehicle("ego", license="DRIFT", color="Red", **car)
         self.scenario.add_vehicle(
             self.ego, pos=self.waypoints[key].pos, rot_quat=self.waypoints[key].rot
         )
+        _dbg("reset: vehicle added")
 
         self._setup_sensors()
+        _dbg("reset: sensors set up")
         time.sleep(1)
 
         # pause physics / time
         self.beamng.control.pause()
+        _dbg("reset: paused, polling sensors")
+
+        # _get_obs no longer polls; refresh the cached sensor data here
+        self._poll_sensors()
+        _dbg("reset: sensors polled")
+        self._prev_state = None
+        self._imu_acc = np.zeros(3, dtype=np.float32)
+        self._imu_angvel = np.zeros(3, dtype=np.float32)
+        self._last_step_time = self.ego.state["time"]
 
         obs = self._get_obs()
+        # anchor the episode clock and score to the freshly spawned car
+        self._score_total = 0.0
+        self._t0 = self.ego.state["time"]
         info = self._get_info()
+        _dbg("reset: done")
 
         return obs, info
 
     def step(self, action):
-        self._action_to_control(action)
+        steering, combined, parkingbrake = (float(value) for value in action["controls"])
+        brake = 0.0
+        throttle = 0.0
+        if combined > 0.0:
+            throttle = combined
+        else:
+            brake = -combined
 
-        # advance exactly 1 frame (blocks until done)
-        self.beamng.control.step(1)
+        # Store the control input and wait for the game to accept
+        # it. This must complete before the step so the tick runs with the
+        # new input regardless of the order the game drains its sockets.
+        r_control = self.ego._send(dict(
+            type="Control",
+            steering=steering,
+            throttle=throttle,
+            brake=brake,
+            parkingbrake=0.0 if parkingbrake < 0.0 else parkingbrake,
+        ))
+        r_control.recv("Controlled")
 
-        # An episode is done if the agent has reached the target
+        # One tick plus the sensor read, sent as one batch. No ack
+        # on the Step: the game processes requests in order and the tick runs
+        # inside the Step handler, so by the time the sensor data arrives the
+        # tick is done. The state["time"] check below catches a stale read
+        # (vehicle socket drained before the engine socket in the same frame)
+        # and re-polls once.
+        self.beamng._send(dict(type="Step", count=1, ack=False))
+        self._send_sensor_request()
+        self._recv_sensor_data()
+        if self.ego.state["time"] - self._last_step_time < 0.04:
+            self._poll_sensors()
+
+        # reward and failure from fresh data, then build the observation
+        self._update_reward_state()
+        self._imu_acc, self._imu_angvel = self._derive_imu(self.ego.state)
         terminated, _ = self._check_failure()
         reward, _ = self._compute_reward()
         observation = self._get_obs()
-        truncated = self.ego.sensors['timer']['time'] > EPISODE_TIMEOUT
+        self._last_step_time = self.ego.state["time"]
+        truncated = (self.ego.state["time"] - self._t0) > EPISODE_TIMEOUT
         info = self._get_info()
-
-        if self.render_mode == "human":
-            self._render_frame()
 
         return observation, reward, terminated, truncated, info
 
@@ -243,16 +445,20 @@ class BeamNGTechEnv(gym.Env):
         pass
 
     def _first_time_setup(self):
+        _dbg("setup: connecting to game")
         self.beamng = BeamNGpy("localhost", 25252)
         self.beamng.open()
+        _dbg("setup: connected, loading scenario")
 
         self.scenario = Scenario("west_coast_usa", "Gymnasium")
 
         self.scenario.make(self.beamng)
         self.beamng.scenario.load(self.scenario)
+        _dbg("setup: scenario loaded")
 
         self.waypoints = self.scenario.find_waypoints()
         self.waypoints = {w.name: w for w in self.waypoints}
+        _dbg(f"setup: {len(self.waypoints)} waypoints")
 
         # done in reset
         car = random.choice(DRIFT_CARS_6SPEED)
@@ -262,8 +468,10 @@ class BeamNGTechEnv(gym.Env):
         self.scenario.add_vehicle(
             self.ego, pos=self.waypoints[key].pos, rot_quat=self.waypoints[key].rot
         )
+        _dbg("setup: vehicle added")
 
         self.beamng.scenario.start()
+        _dbg("setup: scenario started")
 
         self.window = [640, 480]
 
@@ -287,48 +495,28 @@ class BeamNGTechEnv(gym.Env):
         # set deterministic
         self.beamng.queue_lua_command('be:setPhysicsDeterministic(true)')
 
-        # set to a value that your PC can handle and also 20 / fpslimit * factor has to be an integer
-        fpslimit = int(FPS * FPS_FACTOR)
-        self.beamng.queue_lua_command(f"settings.setValue('fpsLimit', {fpslimit})")
-
+        # run the render loop faster than the physics tick so the game's
+        # main loop wakes up more often to process socket requests (each
+        # blocking round trip otherwise waits up to a full frame period).
+        # The physics stays on its fixed 20 Hz tick - step(1) still advances
+        # exactly 50 ms of sim time - but decoupling the render loop from the
+        # tick means the simulation can run FASTER than real time when the
+        # game is resumed. That is fine here: we step explicitly and measure
+        # wall-clock FPS, not sim speed.
+        self.beamng.queue_lua_command(f"settings.setValue('fpsLimit', {RENDER_FPS})")
         self.beamng.queue_lua_command('settings.setValue("fpsLimitEnabled", true)')
-        iterations = FPS / fpslimit * FPS_FACTOR
-        self.beamng.queue_lua_command(f'be:setPhysicsSpeedFactor({iterations})')
+        self.beamng.queue_lua_command('be:setPhysicsSpeedFactor(1)')
 
         # settle
         time.sleep(1)
 
         # pause physics / time
         self.beamng.control.pause()
+        _dbg("setup: done (paused)")
 
     def close(self):
         if self.window is not None:
             self.beamng.close()
-
-    def _read_drift(self):
-        """Drift telemetry as a dict. The lua side packs the fields into a
-        pipe-delimited string (booleans as 1/0); we split and cast here, so no
-        json round-trip is needed."""
-        chunk = (
-            "local s = gameplay_drift_scoring.getScore() "
-            "local b2s = function(x) return x and 1 or 0 end "
-            "return string.format('%s|%s|%s|%s|%s|%s', "
-            "s.potentialScore, s.score, "
-            "b2s(gameplay_drift_drift.getIsDrifting()), "
-            "b2s(gameplay_drift_general.getFrozen()), "
-            "gameplay_drift_drift.getCurrDegAngleSigned(), "
-            "gameplay_drift_drift.getAirSpeed())"
-        )
-        raw = self.beamng.queue_lua_command(chunk, response=True)
-        try:
-            p = str(raw).split("|")
-            return {"potentialScore": float(p[0]), "score": float(p[1]),
-                    "isDrifting": p[2] == "1", "frozen": p[3] == "1",
-                    "angle": float(p[4]), "airSpeed": float(p[5])}
-        except (TypeError, ValueError, IndexError):
-            print("read_drift: unexpected lua response:", repr(raw))
-            return {"potentialScore": 0.0, "score": 0.0, "isDrifting": False,
-                    "frozen": False, "angle": 0.0, "airSpeed": 0.0}
 
     def _check_failure(self):
         """Return (failed: bool, reason: str) from the Damage sensor poll."""
@@ -349,7 +537,7 @@ class BeamNGTechEnv(gym.Env):
         """Return (total, components_dict). All values are floats."""
         comps = {}
 
-        # drift score (game's potentialScore) - a positive component
+        # drift score (self-computed from State) - a positive component
         drift_delta = max(0.0, self.current["score"] - self.previous["score"])
         # 1 percent of the score will be a reward
         drift_reward = min(0.8, drift_delta * 0.01)
@@ -367,7 +555,9 @@ class BeamNGTechEnv(gym.Env):
         # speed under 10kph is punished, 5% of difference to minimum target
         slow_reward = -0.05 * (MIN_SPEED - self.current["speed"]) if self.current["speed"] < MIN_SPEED else 0;
 
-        self.previous = self.current
+        # copy, not a reference: _update_reward_state mutates self.current in
+        # place, so a reference would make every delta zero after the first step
+        self.previous = dict(self.current)
         # save components too - for plotting or debugging - not strictly necessary
         comps["drift_delta"] = drift_delta
         comps["drift_reward"] = drift_reward
@@ -379,80 +569,3 @@ class BeamNGTechEnv(gym.Env):
 
         total = drift_reward + dmg_reward + speed_reward + slow_reward
         return total, comps
-
-    def car_rotation(self, state):
-        """Rotation matrix whose COLUMNS are the car's [forward, left, up] axes in
-        world space, built from the (normalised) dir and up vectors."""
-        d = np.asarray(state["dir"], float); d /= np.linalg.norm(d)
-        u = np.asarray(state["up"], float);  u /= np.linalg.norm(u)
-        l = np.cross(u, d)                     # left
-        l /= np.linalg.norm(l)
-        return np.stack([d, l, u], axis=1)     # columns [fwd, left, up]
-
-    def _travel_slip(self, drift):
-        """Travel-up rotation (rad) from the game's signed drift angle (deg)."""
-        return float(np.deg2rad(drift.get("angle", 0.0)))
-
-    def _lidar_bev(self, pc, state, drift, n=BEV_N, range_m=LIDAR_MAX_DIST):
-        """
-        Prepare a bird's eye view 2D matrix
-        The car is in the center and the maximum range displayed in every direction is the lidar range, normalized to the grid size n
-        The values (seen as brightness / intensity) represent the height of the highest point in the lidar point cloud, clamped to [0, 1] (0.5 = road level)
-
-        Parameters
-        ----------
-        pc : np.ndarray, shape (N, 3)
-            Lidar point cloud in world coordinates; each row is a point (x, y, z) - (fwd, left, up)       
-        state : dict
-            The car's current state, must contain "pos" (world position) and the orientation used by car_rotation
-        drift : dict
-            Drift telemetry from read_drift; must contain "angle", the game's signed drift angle in degrees (nose vs. direction of travel)       
-        n : int, optional
-            Grid size, the output is (n, n) cells (default is BEV_N = 64) 
-        range_m : float, optional
-            Half-extent of the grid in meters; it spans [-range_m, +range_m] around the car in both axes (default is LIDAR_MAX_DIST)
-        """
-
-        # Prepare a n * n 2D matrix which will represent the BEV, default BEV_N * BEV_N
-        out = np.full((n, n), np.nan, np.float32)
-        # return early if there are no lidar points
-        if pc.size == 0:
-            return out
-        # get the car's rotation matrix relative to the world (axis)
-        R = self.car_rotation(state)
-        # subtract the car position from every point cloud dot relative to the car
-        # to get the point cloud translated to be relative to the car
-        # then rotate to match the car's rotation instead of the world's rotation
-        p = (pc - np.asarray(state["pos"], float)) @ R   # [fwd, left, up]
-        # split the points by axis
-        x, y, z = p[:, 0], p[:, 1], p[:, 2]
-        # obtain the drift angle and convert deg -> rad
-        slip = self._travel_slip(drift)
-        # pi/2 is 90 deg - meant to align the grid up axis to the car forward axis
-        # the `slip` angle is subtracted to ensure that the direction of travel
-        # is what finally represents the grid up axis in the BEV grid
-        th = 0.5 * np.pi - slip
-        # with the cos and sin of the angle, we can rotate every point on the (x,y) meaning (fwd,left) axis
-        c, s = np.cos(th), np.sin(th)
-        dx, dy = x * c - y * s, x * s + y * c
-        # ix and iy are translations from physical distances in meters into the column and row
-        # numbers in the BEV grid, rescaling into the BEV_N * BEV_N space, from lidar range
-        ix = ((dx + range_m) * n / (2 * range_m)).astype(int)
-        iy = ((dy + range_m) * n / (2 * range_m)).astype(int)
-        # m is the mask for points that landed in the BEV_N * BEV_N space
-        m = (ix >= 0) & (iy >= 0) & (ix < n) & (iy < n)
-        # cell is the index which represents row and column with a single number
-        # ex: for a 4x4 grid, index 12 would land in the last row and first column
-        # this also flips the grid top to bottom (n-1-iy[m])
-        cell = (n - 1 - iy[m]) * n + ix[m]
-        # get the value of each dot in the BEV representing the height,
-        # clamped to [0, 1] so the channel is bounded (0.5 = road level)
-        h = np.clip((z[m] - Z_LO) / (Z_HI - Z_LO), 0.0, 1.0)
-        # indices sorted low to high
-        order = np.argsort(cell, kind="stable")
-        # identify only the points in the grid where lidar points exist
-        u, first = np.unique(cell[order], return_index=True)
-        # update only those points with height information
-        row, col = u // n, u % n
-        out[row, col] = np.maximum.reduceat(h[order], first)
-        return out

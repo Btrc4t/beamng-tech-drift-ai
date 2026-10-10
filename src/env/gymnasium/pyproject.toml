@@ -8,7 +8,22 @@ packages = ["beamng_tech_env"]
 [project]
 name = "beamng_tech_env"
 version = "0.39.1"
+requires-python = ">=3.10"
 dependencies = [
   "gymnasium",
+  "numpy",
+  "beamngpy",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
   "pre-commit",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "game: tests that launch BeamNG.drive (slow, need BNG_HOME/DISPLAY/XAUTHORITY)",
+  "interactive: tests that need user interaction (skipped unless --interactive is passed)",
 ]
