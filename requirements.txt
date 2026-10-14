@@ -1,0 +1,8 @@
+# Direct dependencies for drift-ai (src/train + src/env/gymnasium).
+# Also install the local env package: ../venv/bin/pip install -e src/env/gymnasium
+beamngpy==1.36
+gymnasium==1.2.2
+numpy==2.5.3
+stable-baselines3==2.9.0
+tensorboard==2.21.0
+torch==2.14.0

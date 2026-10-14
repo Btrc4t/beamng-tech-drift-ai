@@ -64,7 +64,7 @@ def test_determinism(env, n_steps=10):
         obs_list = []
         for _ in range(n_steps):
             # fixed, reproducible action (gearbox is in arcade/auto mode)
-            action = {"controls": np.array([0.0, 0.5, 0.0], np.float32)}
+            action = np.array([0.0, 0.5, 0.0], np.float32)
             obs, *_ = env.step(action)
             obs_list.append({k: v.copy() for k, v in obs.items()})
         return obs_list

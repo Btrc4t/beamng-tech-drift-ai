@@ -75,7 +75,7 @@ def phase_breakdown(env, n_steps=100):
     repolls = 0
     for _ in range(n_steps):
         action = env.action_space.sample()
-        steering, combined, parkingbrake = (float(v) for v in action["controls"])
+        steering, combined, parkingbrake = (float(v) for v in action)
         throttle = combined if combined > 0.0 else 0.0
         brake = -combined if combined < 0.0 else 0.0
         t0 = time.perf_counter()
