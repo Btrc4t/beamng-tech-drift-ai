@@ -1,162 +1,207 @@
 # https://stable-baselines3.readthedocs.io/en/v2.9.0/guide/callbacks.html
 # https://pythonprogramming.net/saving-and-loading-reinforcement-learning-stable-baselines-3-tutorial/
 # install env before with ../venv/bin/pip install -e src/env/gymnasium
-from datetime import datetime
-from enum import Enum
+"""Train the drift policy.
+
+The single entry point for all training work; one subcommand per mode:
+
+``online`` - PPO (default) or TD3 against the live game (needs BNG_HOME and a
+display). Resumes automatically from the newest checkpoint under
+``models/<ALGO>/``, and saves the latest weights on interrupt or when the run
+completes normally. ``--algo td3`` switches to off-policy TD3 (replay buffer,
+deterministic policy, exploration via ``--action-noise``); ``--init`` starts
+from a saved model (e.g. a BC warm start). Replay recording is off by default
+(replays are for human mode); ``--replays`` records the game's native ``.rpl``
+replay per episode.
+
+    python train.py online
+    python train.py online --timesteps 500000 --resume-from best --replays
+    python train.py online --algo td3 --init models/bc/td3/....zip
+
+``offline`` - behavior cloning on a recorded dataset (no game required): PPO
+imitates the recorded actions by maximising their log-likelihood; TD3 is
+deterministic, so it regresses its action output onto them (MSE) instead.
+Needs no reward signal and is the safe baseline: it can only match the
+quality of the data, never exceed it. Interrupting (CTRL+C) saves the current
+weights; resume with ``--init <saved zip>`` (the step counter restarts, so
+pass the remaining steps in ``--steps``).
+
+The observation is the env's float channels plus 20 ultrasonic beams derived
+from the road BEV (the default - distance to the road edge; the LiDAR BEV is
+the fallback for old datasets); ``--no-beams`` observes the raw BEV images
+instead. ``--ai-data`` also trains on the synthetic AI driving data
+(``data/ai``, collected with ``data.collect --ai``). A split dataset (one
+split into ``train/`` and ``validation/`` by ``data.curate split``) trains on
+its ``train`` split by default; ``--split`` selects another one.
+
+    python train.py offline --data data
+    python train.py offline --data data --ai-data
+    python train.py offline --algo td3 --data data
+    python train.py offline --data data --init models/.../best_model.zip
+
+``bootstrap`` - make an offline (BC) model ready to continue online. Loads the
+BC model and writes it as ``last_model.zip`` into a fresh online run dir under
+``models/<ALGO>/``, so a subsequent ``online --algo <algo>`` auto-resumes from
+the cloned weights instead of training from scratch. This is the no-``--init``
+way to do the BC -> online warm start.
+
+    python train.py bootstrap --algo td3
+    python train.py online --algo td3
+
+``drive`` - drive the game with a saved model (SB3 .zip) and report the reward
+for each episode. The env is wrapped to match the model's observation (20
+beams instead of the BEV). ``--episodes N`` drives N scenarios back to back,
+each a fresh reset at a different (reproducible) waypoint; with a fixed
+``--seed`` every model starts from the same spot.
+
+    python train.py drive --model models/bc/td3/<...>.zip --episodes 5 --seed 44
+
+The implementation is split into submodules - commands/ (one module per
+subcommand: online, offline, drive, bootstrap) and common.py (shared
+helpers). The 20-beam observation lives in the env package
+(beamng_tech_env/wrappers.py). This file only parses the CLI and dispatches.
+"""
+import argparse
+import sys
 from pathlib import Path
 
-import gymnasium as gym
-import numpy as np
+import torch as th
 
-from stable_baselines3 import PPO as MODEL
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.ppo import MultiInputPolicy as POLICY
-# Importing the package registers the env id used by gym.make below.
-import beamng_tech_env  # noqa: F401
+# Make the sibling ``data`` package (and this package, for the submodules)
+# importable no matter where this is run from.
+_SRC = str(Path(__file__).resolve().parent.parent)
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
-
-class ResumeFrom(str, Enum):
-    """Which saved checkpoint to resume training from."""
-    LAST = "last_model.zip"   # most recent state (saved on interrupt)
-    BEST = "best_model.zip"   # highest eval reward
+from train.common import DEFAULT_EVAL_FREQ, DEFAULT_STEPS
+from train.commands.bootstrap import cmd_bootstrap
+from train.commands.drive import cmd_drive
+from train.commands.offline import cmd_offline
+from train.commands.online import cmd_online
 
 
-TIMESTEPS=250000
-# Which checkpoint to resume from: the most recent state (LAST) or the
-# highest-eval-reward model (BEST).
-RESUME_FROM = ResumeFrom.LAST
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Train the drift policy (one entry point; see the subcommands)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-def find_latest_model(models_root: Path, resume_from: ResumeFrom) -> Path | None:
-    """Newest run dir (timestamps sort chronologically) holding a checkpoint.
+    p = sub.add_parser("online", help="PPO or TD3 against the live game")
+    p.add_argument("--algo", choices=["ppo", "td3"], default="ppo",
+                   help="algorithm (default: ppo). TD3 is off-policy: it learns "
+                        "from a replay buffer and can warm-start from a BC model "
+                        "via --init")
+    p.add_argument("--timesteps", type=int, default=250_000)
+    p.add_argument("--eval-freq", type=int, default=DEFAULT_EVAL_FREQ,
+                   help="steps between deterministic evals. The eval resets "
+                        "the shared game env, which also caps training "
+                        "episodes at this length (default: 5 min of sim)")
+    p.add_argument("--resume-from", choices=["last", "best"], default="last",
+                   help="checkpoint to resume from (last_model.zip or best_model.zip)")
+    p.add_argument("--replays", action="store_true",
+                   help="record the game's native .rpl replay per episode (off "
+                        "by default; replays are for human mode)")
+    p.add_argument("--ent-coef", type=float, default=0.0,
+                   help="PPO-only entropy bonus coefficient; a small positive "
+                        "value keeps exploration up so the policy can escape the "
+                        "spawn stall (default: 0.0, the SB3 default)")
+    p.add_argument("--init", type=str, default=None,
+                   help="optional path to an SB3 model to start from (e.g. a "
+                        "BC model); takes priority over --resume-from")
+    p.add_argument("--train-freq", type=int, default=4,
+                   help="TD3-only: one gradient step every N env steps "
+                        "(default: 4). SB3's default of one update per episode "
+                        "is far too infrequent for a ~20 FPS sim")
+    p.add_argument("--action-noise", type=float, default=0.1,
+                   help="TD3-only: std of the exploration noise. TD3 is "
+                        "deterministic, so this is its only way to explore "
+                        "(default: 0.1; 0 = no exploration)")
+    p.add_argument("--no-beams", action="store_true",
+                   help="observe the raw BEV image instead of the 20 derived "
+                        "ultrasonic beams (beams are the default)")
+    p.add_argument("--debug-window", action="store_true",
+                   help="show a live cv2 debug window (BEV + beams + "
+                        "telemetry) on a background thread, so the agent "
+                        "loop is not slowed (needs a display)")
+    p.add_argument("--endpoints", type=str, default=None,
+                   help="comma-separated host:port list of game hosts to "
+                        "train against in parallel (e.g. "
+                        "1.2.3.4:5555,6.7.8.9:5556); the port is each host's "
+                        "ZeroMQ port (its tcom port is port+1, internal); when "
+                        "set, training uses a vector env with one ZeroMQ "
+                        "client sub-env per host instead of a single local "
+                        "game (launch each with host_game.py)")
+    p.set_defaults(func=cmd_online)
 
-    Resolution order: (1) ``resume_from``, (2) the other checkpoint type
-    (LAST<->BEST), (3) ``None`` -> the caller trains from scratch. Training
-    from scratch is only the last resort, reached when neither checkpoint
-    exists in any run.
-    """
-    fallback = ResumeFrom.BEST if resume_from is ResumeFrom.LAST else ResumeFrom.LAST
-    for choice in (resume_from, fallback):
-        for run_dir in sorted(models_root.glob("*/"), reverse=True):
-            candidate = run_dir / choice.value
-            if candidate.is_file():
-                if choice is not resume_from:
-                    print(f"no {resume_from.value} found; falling back to {choice.value}")
-                return candidate
-    return None
+    p = sub.add_parser("offline",
+                       help="behavior cloning on a recorded dataset (no game)")
+    p.add_argument("--algo", choices=["ppo", "td3"], default="ppo",
+                   help="ppo: behavior cloning via the Gaussian log-likelihood; "
+                        "td3: deterministic, so it regresses its action output "
+                        "(MSE) instead (default: ppo)")
+    p.add_argument("--data", required=True,
+                   help="dataset directory, or the data root (e.g. data/) "
+                        "to auto-resolve the dataset (prefers 'human')")
+    p.add_argument("--split", default=None,
+                   help="dataset split to train on (e.g. train, validation); "
+                        "default: the 'train' split when the dataset has "
+                        "splits, else all episodes")
+    p.add_argument("--no-synthetic", action="store_true",
+                   help="don't include the <data>/synthetic launch folder "
+                        "(created by `data.curate synthetic`)")
+    p.add_argument("--ai-data", action="store_true",
+                   help="also train on the synthetic AI driving data "
+                        "(data/ai, collected with `data.collect --ai`)")
+    p.add_argument("--steps", type=int, default=None,
+                   help=f"gradient steps (default: per-algo, {DEFAULT_STEPS})")
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--entropy-coef", type=float, default=0.0,
+                   help="PPO-only entropy bonus coefficient (unused for TD3)")
+    p.add_argument("--init", type=str, default=None,
+                   help="optional path to an SB3 model to initialise from")
+    p.add_argument("--out", type=str, default=None, help="where to save the model")
+    p.add_argument("--device", type=str, default="cuda" if th.cuda.is_available() else "cpu",
+                   help="compute device (default: cuda if available, else cpu)")
+    p.add_argument("--log-every", type=int, default=1000,
+                   help="steps between progress prints")
+    p.add_argument("--no-beams", action="store_true",
+                   help="observe the raw BEV image instead of the 20 derived "
+                        "ultrasonic beams (beams are the default)")
+    p.set_defaults(func=cmd_offline)
+
+    p = sub.add_parser("drive", help="drive the game with a saved model")
+    p.add_argument("--model", required=True,
+                   help="SB3 model file (.zip, PPO or TD3)")
+    p.add_argument("--steps", type=int, default=1200,
+                   help="max steps per episode (default: 1200 = 60 sim s)")
+    p.add_argument("--episodes", type=int, default=1,
+                   help="scenarios (resets) to drive back to back; each uses a "
+                        "derived seed (--seed + index) so they differ but stay "
+                        "reproducible (default: 1)")
+    p.add_argument("--seed", type=int, default=None,
+                   help="reset seed for a reproducible spawn; with "
+                        "--episodes > 1 each scenario uses seed + index "
+                        "(default: random)")
+    p.add_argument("--device", type=str,
+                   default="cuda" if th.cuda.is_available() else "cpu")
+    p.add_argument("--debug-window", action="store_true",
+                   help="show a live cv2 debug window (BEV + beams + "
+                        "telemetry) on a background thread, so the agent "
+                        "loop is not slowed (needs a display)")
+    p.set_defaults(func=cmd_drive)
+
+    p = sub.add_parser("bootstrap",
+                       help="make an offline (BC) model ready to continue online")
+    p.add_argument("--algo", choices=["ppo", "td3"], required=True,
+                   help="algorithm of the BC model to bootstrap")
+    p.add_argument("--model", type=str, default=None,
+                   help="BC model to bootstrap (default: the newest under "
+                        "models/bc/<algo>/)")
+    p.set_defaults(func=cmd_bootstrap)
+
+    args = parser.parse_args()
+    args.func(args)
 
 
-class RewardComponentsCallback(BaseCallback):
-    """Log the env's per-step reward components to TensorBoard.
-
-    The env reports each reward term (drift/dmg/slow/fast) in ``info`` every
-    step; this writes them as ``reward/*`` scalars so you can see *why* the
-    total reward moves, not just that it moved.
-    """
-
-    def __init__(self, env, verbose=0):
-        super().__init__(verbose)
-        # gym.make wraps the env in OrderEnforcing/PassiveEnvChecker; the raw
-        # env (which stores reward components in _last_info) sits at the bottom
-        # of that .env chain, so walk down to it
-        while hasattr(env, "env"):
-            env = env.env
-        self.env = env
-        self._tb_writer = None
-        # True until the first on_step; flags the first step of an episode
-        self._prev_done = True
-
-    def _on_step(self) -> bool:
-        if self._tb_writer is None:
-            self._tb_writer = next(
-                (getattr(fmt, "writer", None) for fmt in self.logger.output_formats
-                 if getattr(fmt, "writer", None) is not None),
-                None,
-            )
-        if self._tb_writer is None:
-            return True
-        last_info = getattr(self.env, "_last_info", {})
-        step = self.model.num_timesteps
-        comps = last_info.get("reward_components")
-        if comps:
-            for key, value in comps.items():
-                self._tb_writer.add_scalar(f"reward/{key}", float(value), step)
-        dones = self.locals.get("dones")
-        current_done = bool(np.any(dones)) if dones is not None else False
-        # the env sets failure_reason only on a crash (damage / tire flat), so
-        # this captures the bird's-eye view at the moment of impact
-        if last_info.get("failure_reason"):
-            bev = self.locals.get("new_obs", {}).get("bev")
-            if bev is not None:
-                self._tb_writer.add_image("crash/bev", np.asarray(bev)[0][None, ...], step)
-        # the first step of a new episode (right after a done) logs the reset
-        # bird's-eye view, so you can compare the start state against the crash
-        if self._prev_done:
-            reset_bev = getattr(self.env, "_reset_bev", None)
-            if reset_bev is not None:
-                self._tb_writer.add_image("episode_start/bev", np.asarray(reset_bev)[None, ...], step)
-        self._prev_done = current_done
-        return True
-
-
-class SaveOnInterruptCallback(BaseCallback):
-    """Persist the latest weights when training is interrupted (CTRL+C).
-
-    train.py wraps ``learn()`` in ``try/except KeyboardInterrupt`` and calls
-    :meth:`save_last`, so progress since the last ``best_model`` save is not
-    lost. The model reference is set by SB3 during ``init_callback``.
-    """
-
-    def __init__(self, save_path: Path, verbose: int = 0):
-        super().__init__(verbose)
-        self.save_path = save_path
-
-    def _on_step(self) -> bool:
-        return True
-
-    def save_last(self) -> None:
-        model = getattr(self, "model", None)
-        if model is None:
-            return
-        model.save(self.save_path)
-        if self.verbose:
-            print(f"[interrupt] saved latest model -> {self.save_path}")
-
-
-run_id = datetime.now().strftime("%Y.%m.%d-%H.%M")
-models_dir = Path(f"models/{MODEL.__name__}/{run_id}")
-log_dir = Path(f"logs/{MODEL.__name__}/{run_id}")
-models_dir.mkdir(parents=True, exist_ok=True)
-log_dir.mkdir(parents=True, exist_ok=True)
-
-env = gym.make("beamng_tech_env/BeamNGTech-v0.39", render_mode="human")
-inner_env = env  # gym.make's wrapper; the callback unwraps it to the raw env
-env = Monitor(env, filename=str(log_dir / "monitor.csv"))
-
-# deterministic=True uses the policy's mean action (no sampling noise) for eval;
-# it is independent of the env's own reset-time randomness (random car/waypoint)
-eval_callback = EvalCallback(env, best_model_save_path=models_dir,
-                             log_path=log_dir, eval_freq=1000,
-                             deterministic=True, render=True)
-reward_callback = RewardComponentsCallback(inner_env)
-
-prev_model = find_latest_model(models_dir.parent, RESUME_FROM)
-save_callback = SaveOnInterruptCallback(models_dir / "last_model.zip", verbose=1)
-if prev_model is not None:
-    print(f"Resuming from {prev_model}")
-    model = MODEL.load(prev_model, env=env, verbose=1)
-    # learn() configures its own tensorboard logger from tensorboard_log;
-    # with reset_num_timesteps=False it continues into the newest PPO_* dir.
-    model.tensorboard_log = log_dir
-    try:
-        model.learn(TIMESTEPS, reset_num_timesteps=False,
-                    callback=[eval_callback, reward_callback, save_callback])
-    except KeyboardInterrupt:
-        save_callback.save_last()
-else:
-    print("No saved checkpoint found; training from scratch (last resort)")
-    model = MODEL(POLICY, env, verbose=1, tensorboard_log=log_dir)
-    try:
-        model.learn(TIMESTEPS, callback=[eval_callback, reward_callback, save_callback])
-    except KeyboardInterrupt:
-        save_callback.save_last()
+if __name__ == "__main__":
+    main()

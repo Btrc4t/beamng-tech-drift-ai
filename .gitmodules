@@ -1,0 +1,6 @@
+[submodule "src/env/gymnasium"]
+	path = src/env/gymnasium
+	url = https://github.com/Btrc4t/beamng-tech-drift-env
+[submodule "data/human"]
+	path = data/human
+	url = https://huggingface.co/datasets/daringeyes/beamng-tech-drift

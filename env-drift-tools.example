@@ -1,0 +1,24 @@
+#!/bin/sh
+# Machine-specific paths for drift-ai. Load before running commands:
+#
+#   source ./env-drift-tools
+#
+# Game commands (tests, collection, training, benchmark) also need an X
+# display: DISPLAY and XAUTHORITY must be set in your shell.
+
+export VENV_PATH=~/Projects/venv
+export BNG_HOME=~/Projects/BeamNG.tech.v0.39.4.0
+
+# LD_PRELOAD shim that caps the unpatched beamng_ros2 bridge's 2 kHz scalar
+# publish at 120 Hz (matching the game's 120 fps render loop; see
+# ros2_bridge_local/preload/). Build it first:
+#   cc -O2 -shared -fPIC -o ros2_bridge_local/preload/libbng_ros2_preload.so \
+#       ros2_bridge_local/preload/bng_ros2_preload.c -ldl
+# (or run ros2_bridge_local/build.sh, which does it). The game inherits this
+# from the launching process. BNG_ROS2_PRELOAD_HZ / BNG_ROS2_PRELOAD_EXCLUDE
+# tune it.
+export LD_PRELOAD=~/Projects/drift-ai/ros2_bridge_local/preload/libbng_ros2_preload.so
+
+# cupy is useful when you have more than one GPU, helps process the observation
+# space faster
+export USE_CUPY=false

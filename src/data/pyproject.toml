@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drift-data"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "gymnasium",
+  "numpy",
+  "torch",
+  # data.curate video/play/synthetic import these lazily
+  "matplotlib",
+  "opencv-python",
+  "tensorboard",
+  "stable-baselines3",
+]
+# also needs the local beamng_tech_env package (src/env/gymnasium); it is not
+# on PyPI, so it is installed separately (see the README)
+
+[tool.setuptools]
+# the "data" package is the project directory itself
+package-dir = { "data" = "." }
+packages = ["data"]
