@@ -291,7 +291,7 @@ def _regenerate_offline(ep, rpl, navigraph):
         # the road BEV (1.0 = drivable) around the car, from the cached
         # network; an all-zero grid when the rasterization fails
         try:
-            fwd, left = car_grid_axes(state)
+            fwd, left = car_grid_axes(state, gear)
             road = navigraph.to_bev(state["pos"], fwd=fwd, left=left)
             centerline_dist = road_centerline_segments(
                 navigraph, state["pos"], fwd=fwd, left=left)[1]
