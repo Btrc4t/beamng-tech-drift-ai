@@ -4,7 +4,7 @@ project:
   id: 3f3594ea-b41a-43e0-8cb5-27173aaa003c
   title: BeamNG.tech Drift AI
   description: BeamNG.tech Reinforcement Learning Guide
-  keywords: [drift beamng ai reinforcement learning behavior cloning gymnasium ros2]
+  keywords: [drift beamng ai rl reinforcement machine learning reward behavior cloning gymnasium ros2 sb3 stable baselines CNN BEV birds-eye view LiDAR RNN loss github huggingface fastbook ]
   authors: [Btrc4t]
   github: Btrc4t
   # To autogenerate a Table of Contents, run "myst init --write-toc"
@@ -34,6 +34,6 @@ site:
   options:
     logo_text: BeamNG.tech Drift AI
     favicon: https://beamng.tech/images/favicon.png
-    # logo: site_logo.png
+    logo: https://beamng.tech/images/favicon.png
   parts:
     primary_sidebar_footer: .primary-sidebar-footer.md
