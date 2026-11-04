@@ -1,0 +1,39 @@
+# See docs at: https://mystmd.org/guide/frontmatter
+version: 1
+project:
+  id: 3f3594ea-b41a-43e0-8cb5-27173aaa003c
+  title: BeamNG.tech Drift AI
+  description: BeamNG.tech Reinforcement Learning Guide
+  keywords: [drift beamng ai reinforcement learning behavior cloning gymnasium ros2]
+  authors: [Btrc4t]
+  github: Btrc4t
+  # To autogenerate a Table of Contents, run "myst init --write-toc"
+  toc:
+    - file: README.md
+    - title: Reinforcement Learning Guide
+      children:
+        - file: docs/01_drift_setup.ipynb
+        - file: docs/02_environment_setup.ipynb
+        - file: docs/03_vector_env.ipynb
+        - file: docs/04_learning.ipynb
+        - file: docs/05_realistic_env.ipynb
+    - title: RL Gymnasium Environment
+      children:
+        - file: src/env/gymnasium/README.md
+    - title: Drift Dataset
+      children:
+        - file: data/human/README.md
+    - title: Ros2 Bridge
+      children:
+        - file: ros2_bridge_local/README.md
+        - title: ROS2 Bridge
+    
+site:
+  template: book-theme
+  title: BeamNG.tech Drift AI
+  options:
+    logo_text: BeamNG.tech Drift AI
+    favicon: https://beamng.tech/images/favicon.png
+    # logo: site_logo.png
+  parts:
+    primary_sidebar_footer: .primary-sidebar-footer.md

@@ -8,3 +8,6 @@ ros2_bridge_local/build/
 src/investigation
 env-drift-tools
 data/roads/
+
+# MyST build outputs
+_build

@@ -1,4 +1,4 @@
-# drift-ai
+# BeamNG.tech Drift AI
 
 BeamNG.tech machine learning project that focuses on teaching drifting.
 The project provides a Gymnasium environment ([`beamng_tech_env/BeamNGTech-v0.39`](https://github.com/Btrc4t/beamng-tech-drift-env),
