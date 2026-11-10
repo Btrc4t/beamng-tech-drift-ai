@@ -3,8 +3,6 @@ __pycache__/
 logs*/
 models*/
 !published/*/
-ros2_bridge_local/preload/*.so
-ros2_bridge_local/build/
 src/investigation
 env-drift-tools
 data/roads/

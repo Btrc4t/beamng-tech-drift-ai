@@ -23,11 +23,7 @@ project:
     - title: Drift Dataset
       children:
         - file: data/human/README.md
-    - title: Ros2 Bridge
-      children:
-        - file: ros2_bridge_local/README.md
-        - title: ROS2 Bridge
-    
+
 site:
   template: book-theme
   title: BeamNG.tech Drift AI

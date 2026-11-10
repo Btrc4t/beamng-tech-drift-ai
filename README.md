@@ -349,6 +349,12 @@ The road network is cached at `<data root>/roads/<level>.npz` (the default
 to force a fresh fetch from the game. `--max-steps` caps the live-mode
 episode length.
 
+### Route planning
+
+The environment fetches the game's navigraph once (a tcom `GetRoadGraph` round trip), caches it in `core.roads.Navigraph` for the route geometry, and plans routes with the game's own `map.getPointToPointPath` (the same function the in-game route planner and navigation use).
+
+`core.roads.plan_route_game(start, end)` returns a `Route` including the centerline of the route, its waypoints (a target every 10 m plus one at every game graph node), its length, `route.next_waypoint(pos)` (the nearest waypoint and the distance to it), and `route.progress(pos)` (the arc length along the route of the nearest point on it).
+
 ### Benchmark
 
 Measures headline FPS, a phase breakdown of `step()`, physics

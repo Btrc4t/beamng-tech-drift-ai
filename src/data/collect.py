@@ -11,7 +11,9 @@ choice:
   a random waypoint each episode
 - ``--ai``                  -> synthetic mode: the game's built-in AI drives
   the spawned vehicle (its ``ai_mode`` is set on reset); same read-back and
-  random-spawn mechanics as ``--human``, but no wheel or keyboard needed
+  random-spawn mechanics as ``--human``, but no wheel or keyboard needed.
+  By default (``--ai-mode route``) the AI drives the env's planned route;
+  ``--ai-mode random|span|traffic`` make it wander the road network instead
 - ``--drive``               -> a person drives, but nothing is collected and no
   replay is recorded (a pure debug/inspection mode; combine with ``--debug``
   for the live window). The car respawns on crash/timeout and keeps going.
@@ -33,8 +35,11 @@ Examples::
     python -m data.collect --out data --human
 
     # let the game's built-in AI drive (synthetic data): 20 episodes, the AI
-    # spans the whole road network, recording a .rpl replay per episode
+    # drives the env's planned route, recording a .rpl replay per episode
     python -m data.collect --out data/ai --ai --episodes 20
+
+    # ...or make the AI wander the whole road network instead of the route
+    python -m data.collect --out data/ai --ai --ai-mode span --episodes 20
 
     # ...or collect for an hour of wall-clock time
     python -m data.collect --out data/ai --ai --minutes 60
@@ -171,10 +176,11 @@ def main(argv=None) -> None:
                              "spawned vehicle (its ai_mode is set on reset); "
                              "same read-back and random-spawn mechanics as "
                              "--human, no wheel or keyboard needed")
-    parser.add_argument("--ai-mode", default="span",
-                        choices=["random", "span", "traffic"],
-                        help="the built-in AI's mode for --ai (default span: "
-                             "drive the whole road network)")
+    parser.add_argument("--ai-mode", default="route",
+                        choices=["route", "random", "span", "traffic"],
+                        help="the built-in AI's mode for --ai (default route: "
+                             "drive the env's planned route; random/span/"
+                             "traffic wander the road network instead)")
     parser.add_argument("--ai-speed", type=float, default=None, metavar="MS",
                         help="the built-in AI's speed limit in m/s for --ai "
                              "(default: no limit)")

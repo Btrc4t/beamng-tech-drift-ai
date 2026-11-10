@@ -759,36 +759,42 @@ def test_find_pairs_from_dataset(tmp_path, monkeypatch, capsys):
 
 
 def test_compute_reward():
-    from beamng_tech_env.core.constants import (
-        PROGRESS_BREAK_DIST,
-        PROGRESS_RATE,
-    )
+    from beamng_tech_env.core.constants import WAYPOINT_RATE
     from beamng_tech_env.core.reward import compute_reward
 
     # stationary, undamaged: nothing to reward, the reward is 0
     total, comps = compute_reward(0.0, 0.0, 0.0)
     assert total == 0.0
-    assert comps["progress_reward"] == 0.0
+    assert comps["distance_reward"] == 0.0
     assert comps["drift_reward"] == 0.0
 
-    # jiggling (below the break-even distance): the distance reward is held 0
-    total, comps = compute_reward(PROGRESS_BREAK_DIST * 0.5, 0.0, 0.0)
-    assert comps["progress_reward"] == 0.0
-    assert total == 0.0
+    # closing in on the next waypoint: positive distance reward
+    total, comps = compute_reward(0.5, 0.0, 0.0, 0.5)
+    assert comps["distance_reward"] == WAYPOINT_RATE * 0.5
+    assert total == WAYPOINT_RATE * 0.5
 
-    # moving, drifting: progress + drift, no other components
-    # (centerline_dist=0.0 = on the centerline, so the progress is unscaled)
-    total, comps = compute_reward(0.5, 50.0, 0.0, 0.0)
-    assert comps["progress_reward"] == PROGRESS_RATE * 0.5 - PROGRESS_BREAK_DIST
+    # moving away from the next waypoint: negative distance reward
+    total, comps = compute_reward(0.5, 0.0, 0.0, -0.5)
+    assert comps["distance_reward"] == -WAYPOINT_RATE * 0.5
+    assert total == -WAYPOINT_RATE * 0.5
+
+    # the delta is clamped to the distance travelled in the step (passing a
+    # gate: the nearest waypoint jumps to the next one)
+    total, comps = compute_reward(0.5, 0.0, 0.0, -10.0)
+    assert comps["wp_delta"] == -0.5
+    assert total == -WAYPOINT_RATE * 0.5
+
+    # moving, drifting: distance + drift, no other components
+    total, comps = compute_reward(0.5, 50.0, 0.0, 0.5)
+    assert comps["distance_reward"] == WAYPOINT_RATE * 0.5
     assert comps["drift_reward"] == min(0.8, 50.0 * 0.01)
-    assert total == comps["progress_reward"] + comps["drift_reward"]
+    assert total == comps["distance_reward"] + comps["drift_reward"]
 
     # damage is penalized in the total (capped at -1.0)
-    total, comps = compute_reward(0.5, 50.0, 200.0, 0.0)
+    total, comps = compute_reward(0.5, 50.0, 200.0, 0.5)
     assert comps["dmg_delta"] == 200.0
     assert comps["dmg_reward"] == -1.0
-    assert total == (min(0.8, 50.0 * 0.01)
-                     + (PROGRESS_RATE * 0.5 - PROGRESS_BREAK_DIST) - 1.0)
+    assert total == (min(0.8, 50.0 * 0.01) + WAYPOINT_RATE * 0.5 - 1.0)
 
     # a big drift score is capped at the drift reward ceiling
     total, comps = compute_reward(0.0, 200.0, 0.0)
@@ -798,82 +804,53 @@ def test_compute_reward():
 def test_compute_reward_multipliers():
     from beamng_tech_env.core.constants import (
         OFFROAD_REWARD_MULT,
-        PROGRESS_BREAK_DIST,
-        PROGRESS_RATE,
         REVERSING_REWARD_MULT,
+        WAYPOINT_RATE,
     )
     from beamng_tech_env.core.reward import compute_reward
 
-    base = (min(0.8, 50.0 * 0.01)
-            + (PROGRESS_RATE * 0.5 - PROGRESS_BREAK_DIST))
+    base = min(0.8, 50.0 * 0.01) + WAYPOINT_RATE * 0.5
 
     # on-road, moving forward: the full reward, no multiplier
-    total, comps = compute_reward(0.5, 50.0, 0.0, 0.0)
+    total, comps = compute_reward(0.5, 50.0, 0.0, 0.5)
     assert comps["reward_mult"] == 1.0
     assert total == base
 
     # off-road: the total reward is scaled to OFFROAD_REWARD_MULT
-    total, comps = compute_reward(0.5, 50.0, 0.0, 0.0, offroad=True)
+    total, comps = compute_reward(0.5, 50.0, 0.0, 0.5, offroad=True)
     assert comps["offroad"] is True
     assert comps["reward_mult"] == OFFROAD_REWARD_MULT
     assert total == base * OFFROAD_REWARD_MULT
 
     # reversing (the drift data's flag): the total reward is scaled to
     # REVERSING_REWARD_MULT
-    total, comps = compute_reward(0.5, 50.0, 0.0, 0.0, reversing=True)
+    total, comps = compute_reward(0.5, 50.0, 0.0, 0.5, reversing=True)
     assert comps["reversing"] is True
     assert comps["reward_mult"] == REVERSING_REWARD_MULT
     assert total == base * REVERSING_REWARD_MULT
 
     # both: the lowest multiplier wins (the two never stack)
-    total, comps = compute_reward(0.5, 50.0, 0.0, 0.0, offroad=True,
+    total, comps = compute_reward(0.5, 50.0, 0.0, 0.5, offroad=True,
                                   reversing=True)
     assert comps["reward_mult"] == min(OFFROAD_REWARD_MULT,
                                        REVERSING_REWARD_MULT)
     assert total == base * min(OFFROAD_REWARD_MULT, REVERSING_REWARD_MULT)
 
     # the damage penalty is part of the total, so the multiplier scales it
-    total, comps = compute_reward(0.5, 50.0, 200.0, 0.0, offroad=True)
+    total, comps = compute_reward(0.5, 50.0, 200.0, 0.5, offroad=True)
     assert total == (base - 1.0) * OFFROAD_REWARD_MULT
 
 
-def test_compute_reward_centerline():
-    from beamng_tech_env.core.constants import (
-        CENTERLINE_DIST_MAX,
-        PROGRESS_BREAK_DIST,
-        PROGRESS_RATE,
-    )
+def test_compute_reward_no_route():
     from beamng_tech_env.core.reward import compute_reward
 
-    base = PROGRESS_RATE * 0.5 - PROGRESS_BREAK_DIST   # the progress at 0.5 m
-
-    # on the centerline (dist 0): the full progress reward is kept
-    total, comps = compute_reward(0.5, 0.0, 0.0, 0.0)
-    assert comps["centerline_norm"] == 1.0
-    assert comps["progress_reward"] == base
-
-    # halfway (dist 20 of 40): the progress reward is halved
-    total, comps = compute_reward(0.5, 0.0, 0.0, 20.0)
-    assert comps["centerline_norm"] == 0.5
-    assert comps["progress_reward"] == base * 0.5
-
-    # at the max (dist 40): the progress reward is 0
-    total, comps = compute_reward(0.5, 0.0, 0.0, CENTERLINE_DIST_MAX)
-    assert comps["centerline_norm"] == 0.0
-    assert comps["progress_reward"] == 0.0
-
-    # beyond the max is clamped (still 0 progress)
-    total, comps = compute_reward(0.5, 0.0, 0.0, 100.0)
-    assert comps["centerline_dist"] == CENTERLINE_DIST_MAX
-    assert comps["progress_reward"] == 0.0
-
-    # no centerline (off-road, NaN): treated as far (0 progress)
-    total, comps = compute_reward(0.5, 0.0, 0.0, float("nan"))
-    assert comps["centerline_norm"] == 0.0
-    assert comps["progress_reward"] == 0.0
-    # the drift reward is unaffected by the centerline
-    assert comps["drift_reward"] == 0.0
-    assert total == 0.0
+    # no route (NaN delta): the distance reward is 0.0, the other components
+    # are unaffected
+    total, comps = compute_reward(0.5, 50.0, 0.0, float("nan"))
+    assert comps["wp_delta"] == 0.0
+    assert comps["distance_reward"] == 0.0
+    assert comps["drift_reward"] == min(0.8, 50.0 * 0.01)
+    assert total == comps["drift_reward"]
 
 
 def test_align_episode():
@@ -963,8 +940,6 @@ def test_regen_offline_roundtrip():
     from beamng_tech_env.core.constants import (
         AIRSPEED_MAX_KPH,
         BEV_ROAD_LEVEL,
-        PROGRESS_BREAK_DIST,
-        PROGRESS_RATE,
         gear_to_action,
     )
     from data.regenerate import _regenerate_offline
@@ -1020,20 +995,16 @@ def test_regen_offline_roundtrip():
         np.tile(gear_to_action(2), (out["action"].shape[0], 1)), atol=1e-6)
     # the road BEV covers the road the car is on
     assert (out["obs"]["road_bev"].reshape(T, 64, 64) > 0.5).any(axis=(1, 2)).all()
-    # the reward: progress (per-step distance - break-even, held at 0 when
-    # below it) + zero drift (the car drives straight); the per-step distance
-    # is the chord of the .rpl's path on the episode's 20 Hz grid
-    y20 = rpl.pos[(t20 / 0.025).round().astype(int), 1]
-    dist = np.zeros(T)
-    dist[1:] = np.abs(np.diff(y20))
-    expected = np.maximum(0.0, PROGRESS_RATE * dist - PROGRESS_BREAK_DIST)
-    np.testing.assert_allclose(out["reward"], expected, atol=0.02)
+    # the reward: zero - the offline regeneration has no route (the signed
+    # distance reward is 0.0), the car drives straight (no drift), and the
+    # damage is 0
+    np.testing.assert_allclose(out["reward"], 0.0, atol=0.02)
     assert out["info"][0]["reward_components"]["dmg_delta"] == 0.0
     # the episode's flags/replay are carried over
     assert np.array_equal(out["truncated"], ep["truncated"])
     assert str(out["meta"]["replay"]) == "replays/x.rpl"
-    np.testing.assert_allclose(float(out["meta"]["ep_reward"]),
-                               float(expected.sum()), atol=1e-3)
+    np.testing.assert_allclose(float(out["meta"]["ep_reward"]), 0.0,
+                               atol=1e-3)
 
     # an episode the .rpl can't match is skipped (None): a profile with no
     # correlation to the .rpl's (an alternating one, not a ramp - two ramps

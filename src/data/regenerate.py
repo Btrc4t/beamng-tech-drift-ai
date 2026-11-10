@@ -309,7 +309,8 @@ def _regenerate_offline(ep, rpl, navigraph):
         except Exception:
             on_road = None
         # the reward, with the per-step damage reused from the original
-        # episode (the .rpl doesn't record it)
+        # episode (the .rpl doesn't record it); the signed distance reward is
+        # 0.0 offline (the route's waypoints are unknown without the game)
         distance = (0.0 if prev_pos is None
                     else float(np.linalg.norm(state["pos"] - prev_pos)))
         prev_pos = state["pos"]
@@ -318,7 +319,7 @@ def _regenerate_offline(ep, rpl, navigraph):
             dmg_delta = float(ep["info"][i].get("reward_components", {})
                               .get("dmg_delta", 0.0))
         reward, comps = compute_reward(
-            distance, drift["scoreAdded"], dmg_delta, centerline_dist,
+            distance, drift["scoreAdded"], dmg_delta, 0.0,
             offroad=on_road is False, reversing=drift["reversing"])
         if "ffb" in obs_in:
             ffb.append(obs_in["ffb"][i])

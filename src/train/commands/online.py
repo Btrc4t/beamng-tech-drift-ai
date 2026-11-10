@@ -323,7 +323,7 @@ def _online_model_kwargs(args, env, log_dir) -> dict:
     exploration noise (its only way to explore) and a train_freq: the SB3
     default of one update per episode is far too infrequent for a ~20 FPS sim.
     """
-    kwargs = dict(verbose=1, tensorboard_log=log_dir)
+    kwargs = dict(verbose=1, tensorboard_log=log_dir, n_steps=300)
     if args.algo == "ppo":
         kwargs["ent_coef"] = args.ent_coef
     else:
@@ -406,12 +406,12 @@ def cmd_online(args) -> None:
         # explicit starting point (e.g. a BC model); the critic starts fresh
         # but the actor carries over
         print(f"Initialising from {args.init}")
-        model = MODEL.load(args.init, env=env, verbose=1)
+        model = MODEL.load(args.init, env=env, verbose=1, device='cpu')
         model.tensorboard_log = log_dir
         learn_kwargs = dict(reset_num_timesteps=False)
     elif prev_model is not None:
         print(f"Resuming from {prev_model}")
-        model = MODEL.load(prev_model, env=env, verbose=1)
+        model = MODEL.load(prev_model, env=env, verbose=1, device='cpu')
         # learn() configures its own tensorboard logger from tensorboard_log;
         # with reset_num_timesteps=False it continues into the newest run dir.
         model.tensorboard_log = log_dir
@@ -421,7 +421,7 @@ def cmd_online(args) -> None:
         learn_kwargs = dict(reset_num_timesteps=False)
     else:
         print("No saved checkpoint found; training from scratch (last resort)")
-        model = MODEL(POLICY, env, **_online_model_kwargs(args, env, log_dir))
+        model = MODEL(POLICY, env, **_online_model_kwargs(args, env, log_dir), device='cpu')
         learn_kwargs = dict()
     if args.init or prev_model is not None:
         # a loaded model inherits its hyperparameters from the zip; the saved
