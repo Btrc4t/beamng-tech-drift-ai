@@ -6,7 +6,7 @@ project:
   description: BeamNG.tech Reinforcement Learning Guide
   keywords: [drift beamng ai rl reinforcement machine learning reward behavior cloning gymnasium ros2 sb3 stable baselines CNN BEV birds-eye view LiDAR RNN loss github huggingface fastbook ]
   authors: [Btrc4t]
-  github: Btrc4t
+  github: https://github.com/Btrc4t/beamng-tech-drift-ai
   # To autogenerate a Table of Contents, run "myst init --write-toc"
   toc:
     - file: README.md
@@ -18,11 +18,7 @@ project:
         - file: docs/04_learning.ipynb
         - file: docs/05_realistic_env.ipynb
     - title: RL Gymnasium Environment
-      children:
-        - file: src/env/gymnasium/README.md
-    - title: Drift Dataset
-      children:
-        - file: data/human/README.md
+      file: src/env/gymnasium/README.md
 
 site:
   template: book-theme

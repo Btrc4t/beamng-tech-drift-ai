@@ -154,6 +154,8 @@ An alternative for doing this is using `--init`.
 
 A ZeroMQ game hosting option was created to help speed up training.
 
+`/!\` **You need to have a license for each individual machine hosting an instance of BeamNG.tech**
+
 It uses the request - response pattern where a request is a command, such as `step`, `reset`, and the expected response is made up of [obs, reward, terminated, truncated, info] for `step` or made up of [obs, info] for `reset`.
 
 When training, it's possible to use multiple endpoints by passing a csv of `host:port` entries as the `--endpoints` argument (ex: `--endpoints 127.0.0.1:25252,192.168.1.2:25252`):
@@ -201,9 +203,6 @@ real time; when it ends the command exits and closes the game.
 # or play a .rpl file directly
 "$VENV_PATH/bin/python" -m data.curate play --replay <path/to/file.rpl>
 ```
-
-
-You don't have to be in the docs directory for it to work.
 
 ### Tests
 
