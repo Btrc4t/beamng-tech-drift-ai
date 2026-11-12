@@ -98,7 +98,12 @@ from pathlib import Path
 import numpy as np
 
 from data.dataset import episode_path, episode_paths, resolve_dataset
-from beamng_tech_env.core.constants import AIRSPEED_MAX_KPH, gear_to_action
+from beamng_tech_env.core.constants import (
+    AIRSPEED_MAX_KPH,
+    BEV_N,
+    LIDAR_MAX_DIST,
+    gear_to_action,
+)
 from beamng_tech_env.core.rpl import game_save_dir
 
 # physics tick rate (matches the env); one step = 1/FPS seconds of sim time
@@ -135,6 +140,23 @@ def _load_episode(path):
         meta_keys = [k for k in d.files
                      if k.startswith("ep_") or k in ("seed", "replay", "timestamp", "spawn",
                                                     "space_obs", "space_act", "env_meta")]
+        # the route geometry (world coords) + the per-step BEV pose / route
+        # progress, recorded for the offline video's route render (see the
+        # collector); absent on datasets that predate it (the video then
+        # renders the route blank)
+        route = {
+            "centerline": (d["route_centerline"]
+                           if "route_centerline" in d.files else None),
+            "waypoints": (d["route_waypoints"]
+                          if "route_waypoints" in d.files else None),
+            "gate_s": (d["route_gate_s"]
+                       if "route_gate_s" in d.files else None),
+            "bev_pos": d["bev_pos"] if "bev_pos" in d.files else None,
+            "bev_fwd": d["bev_fwd"] if "bev_fwd" in d.files else None,
+            "bev_left": d["bev_left"] if "bev_left" in d.files else None,
+            "progress": (d["route_progress"]
+                         if "route_progress" in d.files else None),
+        }
         return {
             "obs": obs,
             "action": d["action"],
@@ -144,6 +166,7 @@ def _load_episode(path):
             "info": [dict(x) for x in d["info"]] if "info" in d.files
                     else [{} for _ in d["reward"]],
             "meta": {k: d[k] for k in meta_keys},
+            "route": route,
         }
 
 
@@ -670,35 +693,113 @@ def cmd_synthetic(args):
     print(f"[curate] {verb} {n} synthetic launch episode(s) -> {out_dir}")
 
 
+def _to_bev_grid(points, pos, fwd, left, n=BEV_N, range_m=LIDAR_MAX_DIST):
+    """World (K, 3) points -> BEV grid (row, col) (K, 2) for the car at
+    ``pos`` with car axes ``fwd`` / ``left``: the same transform the live
+    window uses (rig._route_centerline_grid), so the offline video places the
+    route exactly as the online display does."""
+    d = np.asarray(points, float) - np.asarray(pos, float)
+    cell = 2.0 * range_m / n
+    row = (range_m - d @ np.asarray(fwd, float)) / cell
+    col = (range_m - d @ np.asarray(left, float)) / cell
+    return np.stack([row, col], axis=1)
+
+
+def _gate_states(progress, gate_s):
+    """The per-frame gate state (T, M) int8: 0 = not crossed yet, 1 = crossed
+    toward the goal, -1 = crossed away. Replays the live Route.update_gates
+    logic from the recorded per-step route progress and the gate arc lengths
+    (last crossing wins), so the offline video colors the waypoints exactly
+    as the online display does."""
+    t = len(progress)
+    m = len(gate_s)
+    states = np.zeros((t, m), dtype=np.int8)
+    cur = np.zeros(m, dtype=np.int8)
+    last_s = None
+    for i in range(t):
+        s = float(progress[i])
+        if np.isfinite(s):
+            if last_s is not None:
+                if s > last_s:
+                    cur[(gate_s > last_s) & (gate_s <= s)] = 1
+                elif s < last_s:
+                    cur[(gate_s > s) & (gate_s <= last_s)] = -1
+            last_s = s
+        states[i] = cur
+    return states
+
+
 def _render_chunk(args):
     """Worker: render frames [start, end) of one episode into memory.
 
     Runs in its own process. ``args`` is (start, end, data, width,
-    trace_vals) where ``data`` is the (obs, action, reward) tuple (obs a
-    dict of per-step arrays) and ``trace_vals`` the per-step trace values
-    (debug._TRACE_SPECS order): each chunk seeds its rolling window with the
+    trace_vals, route) where ``data`` is the (obs, action, reward) tuple
+    (obs a dict of per-step arrays), ``trace_vals`` the per-step trace values
+    (debug._TRACE_SPECS order) and ``route`` the route render data (see
+    _render_video) or None: each chunk seeds its rolling window with the
     samples before the chunk, so the video shows the same sliding trace the
     live window does (no per-chunk reset). Each frame is rendered through
     the live debug window's code path (beamng_tech_env.debug), so the video
     and the window stay in sync. Returns ``(W, H, frames)`` where ``frames``
     is a uint8 ``(n, H, W, 3)`` BGR array.
     """
-    start, end, data, width, trace_vals = args
+    start, end, data, width, trace_vals, route = args
     import cv2
 
     from beamng_tech_env import debug
+    from beamng_tech_env.core.constants import (
+        NEXT_DELTA_MAX,
+        ROUTE_ANGLE_MAX,
+    )
 
     obs, action, reward = data
     layout = debug.make_layout(width)
     traces = debug.make_traces()
     for (label, *_), values in zip(debug._TRACE_SPECS, trace_vals):
         traces[label].extend(values[:start])
+    # the route telemetry the live window reads from the rig: the recorded
+    # (normalized, clipped) obs channels, scaled back to the panel's raw units
+    # (metres / degrees). Datasets without the channels render them blank.
+    next_arr = obs.get("next")
+    attack_arr = obs.get("attack")
+    turns_arr = obs.get("turns")
+    # the route geometry (world coords) + the per-step BEV pose, recorded for
+    # the offline route render; None on datasets without a route / pose.
+    centerline = (route or {}).get("centerline")
+    waypoints = (route or {}).get("waypoints")
+    bev_pos = (route or {}).get("bev_pos")
+    bev_fwd = (route or {}).get("bev_fwd")
+    bev_left = (route or {}).get("bev_left")
+    states = (route or {}).get("states")
     frames = np.empty((end - start, layout.height, layout.width, 3),
                       dtype=np.uint8)
     for i, t in enumerate(range(start, end)):
         obs_t = {k: v[t] for k, v in obs.items()}
-        payload = debug._payload_from(obs_t, action=action[t],
-                                      reward=float(reward[t]), bev=None)
+        # the route in the BEV for this frame: the recorded world geometry
+        # transformed by the recorded pose (the live window's transform);
+        # blank when the episode has no route or the pose is unavailable.
+        cl = wp = car_pos = None
+        if (centerline is not None and bev_pos is not None
+                and np.isfinite(bev_pos[t]).all()
+                and np.isfinite(bev_fwd[t]).all()
+                and np.isfinite(bev_left[t]).all()):
+            pos_t, fwd_t, left_t = bev_pos[t], bev_fwd[t], bev_left[t]
+            car_pos = [float(v) for v in pos_t]
+            if centerline.shape[0] >= 2:
+                cl = _to_bev_grid(centerline, pos_t, fwd_t, left_t)
+            if (waypoints is not None and waypoints.shape[0]
+                    and states is not None):
+                wp = {"points": _to_bev_grid(waypoints, pos_t, fwd_t, left_t),
+                      "state": states[t]}
+        payload = debug._payload_from(
+            obs_t, action=action[t], reward=float(reward[t]), bev=None,
+            centerline=cl, waypoints=wp, car_pos=car_pos,
+            next_wp_delta=(np.asarray(next_arr[t]) * NEXT_DELTA_MAX).tolist()
+            if next_arr is not None else None,
+            attack_angle=(float(attack_arr[t].reshape(-1)[0])
+                          * ROUTE_ANGLE_MAX) if attack_arr is not None else None,
+            turn_windows=(np.asarray(turns_arr[t]) * ROUTE_ANGLE_MAX).tolist()
+            if turns_arr is not None else None)
         frames[i] = debug._render_frame(cv2, payload, traces, layout)
     return (layout.width, layout.height, frames)
 
@@ -723,6 +824,17 @@ def _render_video(ep, out_path, fps, width, workers=None):
         obs["bev"] = (np.clip(ep["obs"]["road_bev"], 0.0, 1.0)
                       * 255.0).astype(np.uint8)
     data = (obs, ep["action"], ep["reward"])
+    # the route render data: the recorded world-coordinate geometry + the
+    # per-step BEV pose, plus the per-frame gate states (replayed from the
+    # recorded progress, see _gate_states); blank on datasets without a route
+    route_src = ep.get("route") or {}
+    states = None
+    if (route_src.get("waypoints") is not None
+            and route_src.get("gate_s") is not None
+            and route_src.get("progress") is not None
+            and len(route_src["waypoints"]) == len(route_src["gate_s"])):
+        states = _gate_states(route_src["progress"], route_src["gate_s"])
+    route = dict(route_src, states=states)
     # the trace values per step (the _payload_from extraction, vectorised),
     # so each parallel chunk can seed its rolling window with the samples
     # before the chunk: the video shows the same sliding trace the live
@@ -739,7 +851,7 @@ def _render_video(ep, out_path, fps, width, workers=None):
         workers = min(os.cpu_count() or 1, 8)
     workers = max(1, min(workers, T))
     chunk = -(-T // workers)                    # ceil(T / workers)
-    chunk_args = [(i, min(i + chunk, T), data, width, trace_vals)
+    chunk_args = [(i, min(i + chunk, T), data, width, trace_vals, route)
                   for i in range(0, T, chunk)]
 
     if len(chunk_args) == 1:

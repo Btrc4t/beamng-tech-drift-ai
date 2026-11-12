@@ -80,6 +80,38 @@ def _space_payload(observation_space, action_space, env_meta) -> dict:
     }
 
 
+def _stack_poses(pose_hist, t):
+    """Stack a list of per-step ``(pos, fwd, left)`` tuples (or ``None``) into
+    three ``(t, 3)`` float32 arrays (NaN where a pose is None), for the
+    offline video's route render (see collect_episode / TrajectoryRecorder)."""
+    bev_pos = np.full((t, 3), np.nan, dtype=np.float32)
+    bev_fwd = np.full((t, 3), np.nan, dtype=np.float32)
+    bev_left = np.full((t, 3), np.nan, dtype=np.float32)
+    for i, p in enumerate(pose_hist):
+        if p is not None:
+            bev_pos[i], bev_fwd[i], bev_left[i] = p
+    return bev_pos, bev_fwd, bev_left
+
+
+def _route_payload(episode):
+    """The route geometry + pose arrays for an episode's npz payload: the
+    world-coordinate route geometry (``route_centerline`` / ``route_waypoints``
+    / ``route_gate_s``, omitted when the env has no route) and the per-step BEV
+    pose / route progress (``bev_pos`` / ``bev_fwd`` / ``bev_left`` /
+    ``route_progress``), recorded for the offline video's route render."""
+    payload = {}
+    geometry = episode.get("route_geometry")
+    if geometry:
+        for key in ("centerline", "waypoints", "gate_s"):
+            if geometry.get(key) is not None:
+                payload[f"route_{key}"] = np.asarray(
+                    geometry[key], np.float32)
+    for key in ("bev_pos", "bev_fwd", "bev_left", "route_progress"):
+        if key in episode:
+            payload[key] = np.asarray(episode[key], np.float32)
+    return payload
+
+
 class TrajectoryCollector:
     """Collect episodes from an env and save each one as a ``.npz`` file.
 
@@ -128,6 +160,9 @@ class TrajectoryCollector:
         payload["truncated"] = episode["truncated"]
         # info is a list of dicts; store as one object array
         payload["info"] = np.array(episode["info"], dtype=object)
+        # the route geometry + per-step BEV pose / progress, recorded for the
+        # offline video's route render (see collect_episode)
+        payload.update(_route_payload(episode))
         for key, value in meta.items():
             payload[key] = np.array(value)
         payload.update(_space_payload(self.observation_space, self.action_space,
@@ -161,15 +196,41 @@ class TrajectoryCollector:
         if render:
             self.env.render()
 
+        # The route's world-coordinate geometry (centerline + waypoints),
+        # recorded once per episode: the route is fixed for the episode, so the
+        # offline video can place it in the BEV from the per-step pose (see
+        # _save_episode). The rig is reached through the (possibly wrapped)
+        # env; None for envs without a route (the replay env, a route-less run).
+        rig = getattr(getattr(self.env, "unwrapped", self.env), "rig", None)
+        route_geometry = None
+        if rig is not None:
+            fn = getattr(rig, "route_geometry", None)
+            if fn is not None:
+                route_geometry = fn()
+
         obs_hist = []
         action_hist = []
         reward_hist = []
         terminated_hist = []
         truncated_hist = []
         info_hist = []
+        pose_hist = []  # per-step (pos, fwd, left) for the offline video's route render
+        progress_hist = []  # per-step route progress (m) for the gate-state replay
         total_reward = 0.0
 
         for _ in range(max_steps):
+            # The BEV pose and route progress at the current obs's time
+            # (before the step), so they align with obs_hist; None / NaN for
+            # envs without a rig / route.
+            pose = None
+            progress = float("nan")
+            if rig is not None:
+                pose_fn = getattr(rig, "bev_pose", None)
+                if pose_fn is not None:
+                    pose = pose_fn()
+                progress_fn = getattr(rig, "route_progress", None)
+                if progress_fn is not None:
+                    progress = progress_fn()
             if human:
                 # an external driver (a person, or the game's built-in AI)
                 # drives: step with a dummy action and take the applied
@@ -182,6 +243,8 @@ class TrajectoryCollector:
                 action = policy_fn(obs)
                 next_obs, reward, terminated, truncated, step_info = self.env.step(action)
             obs_hist.append(_obs_to_arrays(obs))
+            pose_hist.append(pose)
+            progress_hist.append(progress)
             action_hist.append(np.array(action))
             reward_hist.append(float(reward))
             terminated_hist.append(bool(terminated))
@@ -197,6 +260,11 @@ class TrajectoryCollector:
         # stack the per-step observation dicts into one array per key
         keys = list(obs_hist[0].keys()) if obs_hist else []
         merged_obs = {k: np.stack([step[k] for step in obs_hist]) for k in keys}
+        # the per-step BEV pose (pos, fwd, left) and route progress as (T, 3) /
+        # (T,) float32 arrays (NaN where the env has no rig / route), so the
+        # offline video can place the route geometry in the BEV with the same
+        # transform the live window uses (see _save_episode / data.curate)
+        bev_pos, bev_fwd, bev_left = _stack_poses(pose_hist, len(reward_hist))
         episode = {
             "obs": merged_obs,
             "action": (np.stack(action_hist) if action_hist
@@ -205,6 +273,11 @@ class TrajectoryCollector:
             "terminated": np.array(terminated_hist, dtype=bool),
             "truncated": np.array(truncated_hist, dtype=bool),
             "info": info_hist,
+            "route_geometry": route_geometry,
+            "bev_pos": bev_pos,
+            "bev_fwd": bev_fwd,
+            "bev_left": bev_left,
+            "route_progress": np.array(progress_hist, dtype=np.float32),
         }
 
         # stop the replay before saving so the file is complete on disk
@@ -297,11 +370,17 @@ class TrajectoryRecorder(gym.ObservationWrapper):
         self._spawn = ""
         self._episode_index = len(list(self.out_dir.glob("episode_*.npz")))
         self._last_obs = None
+        self._route_geometry = None
         self._buf = self._new_buffer()
 
     def _new_buffer(self) -> dict:
         return {"obs": [], "action": [], "reward": [], "terminated": [],
-                "truncated": [], "info": []}
+                "truncated": [], "info": [], "pose": [], "progress": []}
+
+    def _rig(self):
+        # the env's rig, reached through the (possibly wrapped) env; None for
+        # envs without one (the replay env, a route-less run)
+        return getattr(getattr(self.env, "unwrapped", self.env), "rig", None)
 
     def observation(self, observation):
         # pass-through: we record but do not transform the observation
@@ -313,13 +392,35 @@ class TrajectoryRecorder(gym.ObservationWrapper):
         self._buf = self._new_buffer()
         self._replay_name = None
         self._spawn = info.get("spawn", "")
+        # the route's world-coordinate geometry, recorded once per episode
+        # (see TrajectoryCollector.collect_episode)
+        self._route_geometry = None
+        rig = self._rig()
+        if rig is not None:
+            fn = getattr(rig, "route_geometry", None)
+            if fn is not None:
+                self._route_geometry = fn()
         if self._replay_recorder is not None:
             self._replay_name = self._replay_recorder.start(self._episode_index)
         return obs, info
 
     def step(self, action):
+        # the BEV pose / route progress at the current (pre-step) state, so
+        # they align with self._last_obs (the pre-step observation)
+        rig = self._rig()
+        pose = None
+        progress = float("nan")
+        if rig is not None:
+            pose_fn = getattr(rig, "bev_pose", None)
+            if pose_fn is not None:
+                pose = pose_fn()
+            progress_fn = getattr(rig, "route_progress", None)
+            if progress_fn is not None:
+                progress = progress_fn()
         obs, reward, terminated, truncated, info = super().step(action)
         self._buf["obs"].append(_obs_to_arrays(self._last_obs))
+        self._buf["pose"].append(pose)
+        self._buf["progress"].append(progress)
         self._buf["action"].append(np.array(action))
         self._buf["reward"].append(float(reward))
         self._buf["terminated"].append(bool(terminated))
@@ -336,6 +437,8 @@ class TrajectoryRecorder(gym.ObservationWrapper):
         if self._replay_recorder is not None:
             self._replay_name = self._replay_recorder.stop(self._episode_index) or self._replay_name
         keys = self._buf["obs"][0].keys()
+        bev_pos, bev_fwd, bev_left = _stack_poses(
+            self._buf["pose"], len(self._buf["reward"]))
         episode = {
             "obs": {k: np.stack([s[k] for s in self._buf["obs"]]) for k in keys},
             "action": np.stack(self._buf["action"]),
@@ -343,6 +446,11 @@ class TrajectoryRecorder(gym.ObservationWrapper):
             "terminated": np.array(self._buf["terminated"], dtype=bool),
             "truncated": np.array(self._buf["truncated"], dtype=bool),
             "info": self._buf["info"],
+            "route_geometry": self._route_geometry,
+            "bev_pos": bev_pos,
+            "bev_fwd": bev_fwd,
+            "bev_left": bev_left,
+            "route_progress": np.array(self._buf["progress"], dtype=np.float32),
         }
         total = float(np.sum(self._buf["reward"]))
         meta = {
@@ -365,6 +473,8 @@ class TrajectoryRecorder(gym.ObservationWrapper):
             "truncated": episode["truncated"],
             "info": np.array(episode["info"], dtype=object),
         })
+        # the route geometry + per-step BEV pose / progress (see reset/step)
+        payload.update(_route_payload(episode))
         payload.update(meta)
         payload.update(_space_payload(self.observation_space, self.action_space,
                                       self.env_meta))
