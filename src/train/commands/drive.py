@@ -2,9 +2,11 @@
 
 ``train.py drive`` loads a saved PPO/TD3 model (.zip) and drives the game
 with it, deterministically. The env is wrapped to match the model's
-observation: BeamsWrapper when the model consumes the 20 beams (the default
-training observation). With ``--episodes N`` it drives N scenarios back to
-back, each a fresh reset at a different (reproducible) waypoint.
+observation: RouteObsWrapper (the route channels next/attack/turns) when the
+model consumes them (the default training observation), and BeamsWrapper
+when it consumes the 20 beams instead of the BEV image. With ``--episodes N``
+it drives N scenarios back to back, each a fresh reset at a different
+(reproducible) waypoint.
 """
 import json
 import zipfile
@@ -16,7 +18,7 @@ from stable_baselines3 import PPO, TD3
 # Importing the package registers the env id used by gym.make below.
 import beamng_tech_env  # noqa: F401
 
-from beamng_tech_env.wrappers import BeamsWrapper
+from beamng_tech_env.wrappers import BeamsWrapper, RouteObsWrapper
 
 
 def cmd_drive(args) -> None:
@@ -42,8 +44,11 @@ def cmd_drive(args) -> None:
                 "and no PPO/TD3 hyperparameters in the saved data")
     model = algo.load(model_path, verbose=0)
     use_beams = "beams" in model.observation_space.spaces
+    use_route_obs = "turns" in model.observation_space.spaces
 
     env = gym.make("beamng_tech_env/BeamNGTech-v0.39", render_mode="human")
+    if use_route_obs:
+        env = RouteObsWrapper(env)
     if use_beams:
         env = BeamsWrapper(env)
     if args.debug_window:

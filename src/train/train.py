@@ -26,13 +26,15 @@ quality of the data, never exceed it. Interrupting (CTRL+C) saves the current
 weights; resume with ``--init <saved zip>`` (the step counter restarts, so
 pass the remaining steps in ``--steps``).
 
-The observation is the env's float channels plus 20 ultrasonic beams derived
-from the road BEV (the default - distance to the road edge; the LiDAR BEV is
-the fallback for old datasets); ``--no-beams`` observes the raw BEV images
-instead. ``--ai-data`` also trains on the synthetic AI driving data
-(``data/ai``, collected with ``data.collect --ai``). A split dataset (one
-split into ``train/`` and ``validation/`` by ``data.curate split``) trains on
-its ``train`` split by default; ``--split`` selects another one.
+The observation is the env's float channels plus the LiDAR BEV image and the
+route channels (next/attack/turns - the delta to the next route waypoint,
+the attack angle, and the upcoming route turns; the default). ``--beams``
+observes the 20 derived ultrasonic beams instead of the BEV image, and
+``--no-route-obs`` (online) drops the route channels. ``--ai-data`` also
+trains on the synthetic AI driving data (``data/ai``, collected with
+``data.collect --ai``). A split dataset (one split into ``train/`` and
+``validation/`` by ``data.curate split``) trains on its ``train`` split by
+default; ``--split`` selects another one.
 
     python train.py offline --data data
     python train.py offline --data data --ai-data
@@ -49,10 +51,11 @@ way to do the BC -> online warm start.
     python train.py online --algo td3
 
 ``drive`` - drive the game with a saved model (SB3 .zip) and report the reward
-for each episode. The env is wrapped to match the model's observation (20
-beams instead of the BEV). ``--episodes N`` drives N scenarios back to back,
-each a fresh reset at a different (reproducible) waypoint; with a fixed
-``--seed`` every model starts from the same spot.
+for each episode. The env is wrapped to match the model's observation (the
+route channels and/or the 20 beams instead of the BEV). ``--episodes N``
+drives N scenarios back to back, each a fresh reset at a different
+(reproducible) waypoint; with a fixed ``--seed`` every model starts from the
+same spot.
 
     python train.py drive --model models/bc/td3/<...>.zip --episodes 5 --seed 44
 
@@ -115,9 +118,12 @@ def main() -> None:
                    help="TD3-only: std of the exploration noise. TD3 is "
                         "deterministic, so this is its only way to explore "
                         "(default: 0.1; 0 = no exploration)")
-    p.add_argument("--no-beams", action="store_true",
-                   help="observe the raw BEV image instead of the 20 derived "
-                        "ultrasonic beams (beams are the default)")
+    p.add_argument("--beams", action="store_true",
+                   help="observe the 20 derived ultrasonic beams instead of "
+                        "the LiDAR BEV image (the BEV is the default)")
+    p.add_argument("--no-route-obs", action="store_true",
+                   help="don't add the route channels (next/attack/turns) to "
+                        "the observation (they are on by default)")
     p.add_argument("--debug-window", action="store_true",
                    help="show a live cv2 debug window (BEV + beams + "
                         "telemetry) on a background thread, so the agent "
@@ -164,9 +170,9 @@ def main() -> None:
                    help="compute device (default: cuda if available, else cpu)")
     p.add_argument("--log-every", type=int, default=1000,
                    help="steps between progress prints")
-    p.add_argument("--no-beams", action="store_true",
-                   help="observe the raw BEV image instead of the 20 derived "
-                        "ultrasonic beams (beams are the default)")
+    p.add_argument("--beams", action="store_true",
+                   help="observe the 20 derived ultrasonic beams instead of "
+                        "the LiDAR BEV image (the BEV is the default)")
     p.set_defaults(func=cmd_offline)
 
     p = sub.add_parser("drive", help="drive the game with a saved model")

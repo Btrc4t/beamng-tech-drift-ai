@@ -518,12 +518,15 @@ _SPAWN_DEFAULTS = {
 }
 
 
-def _tb_spawn_obs(bev_event, scalars):
+def _tb_spawn_obs(bev_event, scalars, space_obs):
     """Rebuild one spawn observation from a TB image event + its step scalars.
 
     The BEV comes from the ``episode_start/bev`` image; each numeric channel
     comes from the ``episode_start/*`` scalar logged at the same step, or a
-    canonical neutral-spawn default when that scalar is absent."""
+    canonical neutral-spawn default when that scalar is absent. The route
+    channels are included only when the dataset's space carries them (newer
+    envs): from their ``episode_start/*`` scalars, or the neutral (no-route)
+    values when absent."""
     import cv2
     arr = cv2.imdecode(np.frombuffer(bev_event.encoded_image_string, np.uint8),
                        cv2.IMREAD_GRAYSCALE)
@@ -533,7 +536,7 @@ def _tb_spawn_obs(bev_event, scalars):
         return float(scalars[tag]) if tag in scalars else float(default)
 
     d = _SPAWN_DEFAULTS
-    return {
+    obs = {
         "rpm":         np.array([val("episode_start/rpm", d["rpm"])], np.float32),
         "imu_acc":     np.array([val("episode_start/imu_acc[0]", d["imu_acc"][0]),
                                  val("episode_start/imu_acc[1]", d["imu_acc"][1]),
@@ -548,15 +551,27 @@ def _tb_spawn_obs(bev_event, scalars):
         "ffb":         np.array([val("episode_start/ffb", d["ffb"])], np.float32),
         "bev":         bev,
     }
+    for key, size in (("next", 3), ("attack", 1), ("turns", 3)):
+        if key not in space_obs.spaces:
+            continue
+        if size == 1:
+            obs[key] = np.array([val(f"episode_start/{key}", 0.0)], np.float32)
+        else:
+            obs[key] = np.array(
+                [val(f"episode_start/{key}[{j}]", 0.0) for j in range(size)],
+                np.float32)
+    return obs
 
 
-def _read_tb_spawns(log_dir, n_runs):
+def _read_tb_spawns(log_dir, n_runs, space_obs):
     """Spawn observations from the newest ``n_runs`` TensorBoard runs.
 
     Each ``episode_start/bev`` image is one spawn; the ``episode_start/*``
     scalars logged at the same step supply the numeric channels. Returns
     ``(spawns, run_names)``; both are empty when the log dir is missing or no
-    run has spawn images."""
+    run has spawn images. ``space_obs`` (the dataset's observation space)
+    selects which channels the rebuilt obs carries (the route channels are
+    included only when the space has them)."""
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     log_root = Path(log_dir)
     if not log_root.is_dir():
@@ -584,7 +599,8 @@ def _read_tb_spawns(log_dir, n_runs):
             for ev in ea.Scalars(tag):
                 scalars_by_step.setdefault(ev.step, {})[tag] = ev.value
         for ev in ea.Images("episode_start/bev"):
-            spawns.append(_tb_spawn_obs(ev, scalars_by_step.get(ev.step, {})))
+            spawns.append(_tb_spawn_obs(ev, scalars_by_step.get(ev.step, {}),
+                                        space_obs))
     return spawns, run_names
 
 
@@ -602,7 +618,7 @@ def cmd_synthetic(args):
     space_obs, space_act, env_meta = _load_spaces(data_dir)
 
     # the initial observations come solely from the TensorBoard logs
-    spawns, run_names = _read_tb_spawns(args.log_dir, args.runs)
+    spawns, run_names = _read_tb_spawns(args.log_dir, args.runs, space_obs)
     if not spawns:
         raise SystemExit(
             f"[curate] no spawn observations in {args.log_dir}; run online "

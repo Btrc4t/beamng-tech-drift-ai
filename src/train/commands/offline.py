@@ -1,8 +1,8 @@
 """Offline training on a recorded dataset (no game required).
 
-The observation is the env's float channels plus 20 ultrasonic beams derived
-from the road BEV (the default - distance to the road edge; the LiDAR BEV is
-the fallback for old datasets); ``--no-beams`` observes the raw BEV images
+The observation is the dataset's channels: the env's float channels plus the
+LiDAR BEV image and the route channels (next/attack/turns) when the dataset
+carries them; ``--beams`` swaps the BEV image for 20 derived ultrasonic beams
 instead.
 
 ``train.py offline --algo {ppo,td3}`` - behavior cloning (SB3): PPO imitates
@@ -174,10 +174,10 @@ def _save(model, out) -> Path:
 
 def cmd_offline(args) -> None:
     args.steps = args.steps or DEFAULT_STEPS[args.algo]
-    use_beams = not args.no_beams
+    use_beams = args.beams
     dataset, _ = load_training_dataset(args)
-    # SB3 behavior cloning: the observation is beams (the default) or the raw
-    # BEV (--no-beams)
+    # SB3 behavior cloning: the observation is the dataset's channels (the
+    # BEV image by default, or the 20 beams with --beams)
     buffer = build_replay_buffer(dataset, use_beams=use_beams, device=args.device)
     obs_space = beams_space(dataset.observation_space, use_beams)
     train_bc(args, buffer, obs_space, dataset.action_space)

@@ -5,14 +5,14 @@ Two modes:
 - **offline** (the default): no game. Each episode is rebuilt from its
   ``.rpl`` (the recorded pose/electrics are the ground truth for the
   driving): the pose/electrics-derived channels (drift, airspeed, gear, rpm,
-  IMU, action), the road BEV (rasterized from the cached road network) and
-  the reward (the current formula) are recomputed, while the channels the
-  ``.rpl`` doesn't carry (the force feedback, the per-step damage) are
-  reused from the original episode. The ``bev`` channel is the corrected
+  IMU, action) and the reward (the current formula) are recomputed, while the
+  channels the ``.rpl`` doesn't carry (the force feedback, the per-step
+  damage) are reused from the original episode. The ``bev`` channel is the corrected
   LiDAR: the original episode's LiDAR BEV, corrected against the road
   network (a bare ``.rpl`` has no LiDAR returns, so there the road BEV is
-  the LiDAR: road surface = road level, off-road = obstacle), and the beams
-  are computed on it. The
+  the LiDAR: road surface = road level, off-road = obstacle). The route
+  channels (next/attack/turns) are neutral (zero): the ``.rpl`` doesn't
+  record the route. The
   episode's step grid (20 Hz) is kept; the ``.rpl`` is aligned to it first,
   since a curated episode may start part-way into its ``.rpl`` (the leading
   idle is truncated away). The game is used once, only to fetch the road
@@ -61,7 +61,6 @@ from beamng_tech_env.core.constants import (
     BEV_N,
     DEFAULT_STEERING_WHEEL_LOCK,
     MAX_GEAR,
-    ON_ROAD_FAST_TRACK_DIST,
     TICK_DT,
     gear_to_action,
 )
@@ -76,7 +75,6 @@ from beamng_tech_env.core.rpl import RplTrajectory, game_save_dir, quat_to_axes
 from beamng_tech_env.core.roads import (
     Navigraph,
     car_grid_axes,
-    road_centerline_segments,
 )
 from data.collector import TrajectoryCollector
 from data.curate import _load_episode
@@ -251,7 +249,7 @@ def _regenerate_offline(ep, rpl, navigraph):
 
     obs = {k: [] for k in ("rpm", "imu_acc", "imu_angvel", "drift_angle",
                            "airspeed", "is_shifting", "gear")}
-    ffb, bev, road_bev = [], [], []
+    ffb, bev = [], []
     action_hist, reward_hist, info_hist = [], [], []
     prev_state = None
     prev_pos = None
@@ -288,24 +286,19 @@ def _regenerate_offline(ep, rpl, navigraph):
             ], dtype=np.float32),
             gear_to_action(int(round(gear))),
         ])
-        # the road BEV (1.0 = drivable) around the car, from the cached
-        # network; an all-zero grid when the rasterization fails
+        # the road grid (1.0 = drivable) around the car, from the cached
+        # network (used to correct the LiDAR BEV below); an all-zero grid
+        # when the rasterization fails
         try:
             fwd, left = car_grid_axes(state, gear)
             road = navigraph.to_bev(state["pos"], fwd=fwd, left=left)
-            centerline_dist = road_centerline_segments(
-                navigraph, state["pos"], fwd=fwd, left=left)[1]
         except Exception:
             road = np.zeros((BEV_N, BEV_N), float)
-            centerline_dist = float("nan")
         road = to_cpu(road)
-        # on-road determination, mirroring the live env (rig.on_road): the
-        # fast-track reuses the centerline distance just computed (NaN
-        # compares False and falls through to the strict check), the strict
-        # navigraph check decides the rest; off-road scales the reward down
+        # on-road determination (mirrors the live env's no-route path): the
+        # strict navigraph check; off-road scales the reward down
         try:
-            on_road = (centerline_dist < ON_ROAD_FAST_TRACK_DIST
-                       or navigraph.is_on_road(state["pos"]))
+            on_road = navigraph.is_on_road(state["pos"])
         except Exception:
             on_road = None
         # the reward, with the per-step damage reused from the original
@@ -325,7 +318,6 @@ def _regenerate_offline(ep, rpl, navigraph):
             ffb.append(obs_in["ffb"][i])
         else:
             ffb.append(np.array([0.0], np.float32))
-        road_bev.append(road[None, ...].astype(np.float32))
         # the corrected LiDAR BEV: the original episode's LiDAR, corrected
         # against the road network (step i is the same physics tick), or -
         # for a bare .rpl with no LiDAR - the road network itself (road
@@ -347,7 +339,11 @@ def _regenerate_offline(ep, rpl, navigraph):
         "gear":        np.array(obs["gear"], np.float32).reshape(T, 1),
         "ffb":         np.array(ffb, np.float32).reshape(T, 1),
         "bev":         np.array(bev, np.uint8),
-        "road_bev":    np.array(road_bev, np.float32),
+        # the route channels are neutral: the offline regeneration has no
+        # route (the .rpl doesn't record one)
+        "next":        np.zeros((T, 3), np.float32),
+        "attack":      np.zeros((T, 1), np.float32),
+        "turns":       np.zeros((T, 3), np.float32),
     }
     meta = {}
     if ep is not None:
@@ -414,9 +410,11 @@ def _load_navigraph(path, level):
 
 def _run_offline(pairs, args) -> None:
     # the spaces are read from a game-free env construction (the constructor
-    # only builds the spaces and the driver/rig objects)
+    # only builds the spaces and the driver/rig objects); the route channels
+    # are part of the default observation, so the wrapper's space
     from beamng_tech_env.envs.beamng_tech import BeamNGTechEnv
-    env = BeamNGTechEnv()
+    from beamng_tech_env.wrappers import RouteObsWrapper
+    env = RouteObsWrapper(BeamNGTechEnv())
     space_obs, space_act = env.observation_space, env.action_space
     roads = (Path(args.roads) if args.roads
              else Path(args.data).parent / "roads" / f"{args.level}.npz")
@@ -501,8 +499,11 @@ def _reuse_ffb(out_path, ep_path):
 def _run_live(pairs, args) -> None:
     import beamng_tech_env  # noqa: F401  (registers the env ids)
     from beamng_tech_env.envs.replay_env import BeamNGReplayEnv
+    from beamng_tech_env.wrappers import RouteObsWrapper
 
-    env = BeamNGReplayEnv()
+    # the route channels are part of the default observation; the replay env
+    # has no route (the .rpl doesn't record one), so they read neutral
+    env = RouteObsWrapper(BeamNGReplayEnv())
     collector = TrajectoryCollector(env, out_dir=args.out,
                                     env_meta={"env_id": ENV_ID})
     stats = []

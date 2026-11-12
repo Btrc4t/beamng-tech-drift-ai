@@ -1,8 +1,9 @@
 """Online training against the live game (PPO or TD3).
 
-The observation is the env's float channels plus 20 ultrasonic beams derived
-from the road BEV (the default - distance to the road edge); ``--no-beams``
-observes the raw BEV images instead.
+The observation is the env's float channels plus the LiDAR BEV image and the
+route channels (next/attack/turns, via RouteObsWrapper - the default);
+``--beams`` swaps the BEV image for 20 derived ultrasonic beams, and
+``--no-route-obs`` drops the route channels.
 
 ``train.py online``: resumes automatically from the newest checkpoint under
 ``models/<ALGO>/``, and saves the latest weights on interrupt or when the run
@@ -28,7 +29,7 @@ from stable_baselines3.common.vec_env import VecEnvWrapper
 # Importing the package registers the env id used by gym.make below.
 import beamng_tech_env  # noqa: F401
 
-from beamng_tech_env.wrappers import BeamsWrapper
+from beamng_tech_env.wrappers import BeamsWrapper, RouteObsWrapper
 from train.common import (ALGOS, DEFAULT_EVAL_FREQ, REPLAY_PREFIX, ResumeFrom,
                           find_latest_model)
 
@@ -345,11 +346,16 @@ def cmd_online(args) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     endpoints = _parse_endpoints(args.endpoints) if args.endpoints else None
-    use_beams = not args.no_beams
+    use_beams = args.beams
+    use_route_obs = not args.no_route_obs
 
     def _wrap_sub_env(env):
+        if use_route_obs:
+            # the default observation: the BEV image plus the route channels
+            # (next/attack/turns)
+            env = RouteObsWrapper(env)
         if use_beams:
-            # the default observation swaps the BEV image for 20 ultrasonic beams
+            # the legacy observation swaps the BEV image for 20 ultrasonic beams
             env = BeamsWrapper(env)
         return env
 

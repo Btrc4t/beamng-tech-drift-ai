@@ -28,6 +28,9 @@ class TinyDriftEnv(gym.Env):
             "drift_angle": spaces.Box(-1.0, 1.0, (1,), np.float32),
             "airspeed": spaces.Box(0.0, 1.0, (1,), np.float32),
             "gear": spaces.Box(0.0, 1.0, (1,), np.float32),
+            "next": spaces.Box(-1.0, 1.0, (3,), np.float32),
+            "attack": spaces.Box(-1.0, 1.0, (1,), np.float32),
+            "turns": spaces.Box(-1.0, 1.0, (3,), np.float32),
             "bev": spaces.Box(0, 255, bev, np.uint8),
         })
         # match the real env's action layout: [steering, throttle/brake,
@@ -56,6 +59,11 @@ class TinyDriftEnv(gym.Env):
             "drift_angle": (rng.random((1,)) - 0.5).astype(np.float32),
             "airspeed": rng.random((1,)).astype(np.float32),
             "gear": np.array([(gear + 1) / 7.0], dtype=np.float32),
+            # the route channels: a time-varying "next" (the gate gets
+            # closer), the rest neutral
+            "next": np.array([0.0, min(1.0, self._t * 0.25), 0.0], np.float32),
+            "attack": np.zeros(1, np.float32),
+            "turns": np.zeros(3, np.float32),
             "bev": rng.integers(0, 256, (1, 36, 36), dtype=np.uint8),
         }
 

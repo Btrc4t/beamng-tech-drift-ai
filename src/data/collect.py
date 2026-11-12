@@ -249,6 +249,10 @@ def main(argv=None) -> None:
                    ai_mode=(args.ai_mode if args.ai else False),
                    ai_speed=args.ai_speed,
                    ai_aggression=args.ai_aggression)
+    # the route channels (next/attack/turns) are part of the default
+    # observation, so the collected episodes carry them
+    from beamng_tech_env.wrappers import RouteObsWrapper
+    env = RouteObsWrapper(env)
     policy = ("ai" if args.ai
               else ("human" if args.human
                     else (_load_model(args.model, args.algo) if args.model else None)))

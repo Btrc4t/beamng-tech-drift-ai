@@ -940,9 +940,12 @@ def test_regen_offline_roundtrip():
     from beamng_tech_env.core.constants import (
         AIRSPEED_MAX_KPH,
         BEV_ROAD_LEVEL,
+        TICK_DT,
         gear_to_action,
     )
-    from data.regenerate import _regenerate_offline
+    from beamng_tech_env.core.array import to_cpu
+    from beamng_tech_env.core.roads import car_grid_axes
+    from data.regenerate import _regenerate_offline, _resample_rpl
 
     rpl = _synthetic_rpl()
     navigraph = _synthetic_navigraph()
@@ -973,16 +976,36 @@ def test_regen_offline_roundtrip():
     out = _regenerate_offline(ep, rpl, navigraph)
     assert out is not None
 
+    # the road reference is recomputed the way the regeneration does (the
+    # road_bev channel is no longer saved): the per-step pose from the
+    # resampled .rpl, rasterized from the same navigraph
+    times = np.minimum(offset + np.arange(T) * TICK_DT, rpl.t[-1])
+    states, _ = _resample_rpl(rpl, times)
+    roads = []
+    for state in states:
+        fwd, left = car_grid_axes(state, 2.0)
+        roads.append(to_cpu(navigraph.to_bev(state["pos"], fwd=fwd, left=left)))
+    road = np.stack(roads).reshape(T, 64, 64)
+
     # the FFB is reused from the original, untouched; the LiDAR BEV is the
     # original, corrected against the road network (road surface = road
     # level, the off-road returns as the LiDAR saw them)
     assert np.array_equal(out["obs"]["ffb"], ffb)
     bev = out["obs"]["bev"]
     assert bev.dtype == np.uint8
-    road = out["obs"]["road_bev"].reshape(T, 64, 64)
     np.testing.assert_array_equal(
         bev.reshape(T, 64, 64),
         np.where(road > 0.5, BEV_ROAD_LEVEL, 100).astype(np.uint8))
+    # the road_bev channel is no longer saved
+    assert "road_bev" not in out["obs"]
+    # the route channels are neutral: the offline regeneration has no route
+    # (the .rpl doesn't record one)
+    assert out["obs"]["next"].shape == (T, 3)
+    assert out["obs"]["attack"].shape == (T, 1)
+    assert out["obs"]["turns"].shape == (T, 3)
+    np.testing.assert_allclose(out["obs"]["next"], 0.0)
+    np.testing.assert_allclose(out["obs"]["attack"], 0.0)
+    np.testing.assert_allclose(out["obs"]["turns"], 0.0)
     # the .rpl-derived channels are recomputed at the aligned time
     np.testing.assert_allclose(out["obs"]["airspeed"].reshape(-1),
                                v * 3.6 / AIRSPEED_MAX_KPH, atol=1e-2)
@@ -993,8 +1016,8 @@ def test_regen_offline_roundtrip():
     np.testing.assert_allclose(
         out["action"][:, 3:],
         np.tile(gear_to_action(2), (out["action"].shape[0], 1)), atol=1e-6)
-    # the road BEV covers the road the car is on
-    assert (out["obs"]["road_bev"].reshape(T, 64, 64) > 0.5).any(axis=(1, 2)).all()
+    # the road covers the road the car is on
+    assert (road > 0.5).any(axis=(1, 2)).all()
     # the reward: zero - the offline regeneration has no route (the signed
     # distance reward is 0.0), the car drives straight (no drift), and the
     # damage is 0
